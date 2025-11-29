@@ -79,6 +79,8 @@ apt install libssl-dev -y
 apt install libgmp-dev -y
 ```
 
+Build the default keyhunt binary with `make` or `make keyhunt`. Use `make bsgsd` for the daemon and `make legacy` for the GMP-based build.
+
 To clone the repository
 
 ```
