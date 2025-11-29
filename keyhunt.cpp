@@ -11,8 +11,11 @@ email: albertobsd@gmail.com
 #include <time.h>
 #include <vector>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <inttypes.h>
+#include <thread>
+#include <algorithm>
 #include "base58/libbase58.h"
 #include "rmd160/rmd160.h"
 #include "oldbloom/oldbloom.h"
@@ -355,6 +358,59 @@ static unsigned long generate_seed() {
 static uint64_t compute_shard_entries(uint64_t total_elements, uint64_t minimum) {
         uint64_t shard = (total_elements + 255ULL) / 256ULL;
         return (shard < minimum) ? minimum : shard;
+}
+
+static void apply_large_file_buffer(FILE *fd) {
+        if(fd != NULL) {
+                setvbuf(fd, NULL, _IOFBF, 16 * 1024 * 1024);
+        }
+}
+
+static bool verify_bloom_checksums_parallel(struct bloom *blooms, struct checksumsha256 *checksums, size_t count, const char *label) {
+        if(FLAGSKIPCHECKSUM) {
+                return true;
+        }
+
+        unsigned int workers = std::thread::hardware_concurrency();
+        if(workers == 0) {
+                workers = 4;
+        }
+
+        size_t chunk = (count + workers - 1) / workers;
+        std::atomic<bool> ok(true);
+        std::vector<std::thread> threads;
+        threads.reserve(workers);
+
+        auto verify_chunk = [&](size_t start, size_t end) {
+                uint8_t rawvalue[32];
+                for(size_t i = start; i < end && ok.load(std::memory_order_relaxed); ++i) {
+                        sha256((uint8_t*)blooms[i].bf, blooms[i].bytes, (uint8_t*)rawvalue);
+                        if(memcmp(checksums[i].data, rawvalue, 32) != 0 || memcmp(checksums[i].backup, rawvalue, 32) != 0) {
+                                ok.store(false, std::memory_order_relaxed);
+                                break;
+                        }
+                }
+        };
+
+        for(unsigned int t = 0; t < workers; ++t) {
+                size_t start = t * chunk;
+                if(start >= count) {
+                        break;
+                }
+                size_t end = std::min(count, start + chunk);
+                threads.emplace_back(verify_chunk, start, end);
+        }
+
+        for(auto &th : threads) {
+                if(th.joinable()) {
+                        th.join();
+                }
+        }
+
+        if(!ok.load()) {
+                fprintf(stderr,"[E] Error checksum file mismatch! %s\n",label);
+        }
+        return ok.load();
 }
 
 const long double BLOOM_ERROR_MAIN = 0.00000001L; // 1e-8
@@ -1369,6 +1425,7 @@ rseed(generate_seed());
 			snprintf(buffer_bloom_file,1024,"keyhunt_bsgs_4_%" PRIu64 ".blm",bsgs_m);
 			fd_aux1 = fopen(buffer_bloom_file,"rb");
 			if(fd_aux1 != NULL)	{
+				apply_large_file_buffer(fd_aux1);
 				printf("[+] Reading bloom filter from file %s ",buffer_bloom_file);
 				fflush(stdout);
 				for(i = 0; i < 256;i++)	{
@@ -1389,19 +1446,15 @@ rseed(generate_seed());
 						fprintf(stderr,"[E] Error reading the file %s\n",buffer_bloom_file);
 						exit(EXIT_FAILURE);
 					}
-					if(FLAGSKIPCHECKSUM == 0)	{
-						sha256((uint8_t*)bloom_bP[i].bf,bloom_bP[i].bytes,(uint8_t*)rawvalue);
-						if(memcmp(bloom_bP_checksums[i].data,rawvalue,32) != 0 || memcmp(bloom_bP_checksums[i].backup,rawvalue,32) != 0 )	{	/* Verification */
-							fprintf(stderr,"[E] Error checksum file mismatch! %s\n",buffer_bloom_file);
-							exit(EXIT_FAILURE);
-						}
-					}
 					if(i % 64 == 0 )	{
 						printf(".");
 						fflush(stdout);
 					}
 				}
 				printf(" Done!\n");
+				if(!verify_bloom_checksums_parallel(bloom_bP, bloom_bP_checksums, 256, buffer_bloom_file)) {
+					exit(EXIT_FAILURE);
+				}
 				fclose(fd_aux1);
 				memset(buffer_bloom_file,0,1024);
 				snprintf(buffer_bloom_file,1024,"keyhunt_bsgs_3_%" PRIu64 ".blm",bsgs_m);
@@ -1472,6 +1525,7 @@ rseed(generate_seed());
 			snprintf(buffer_bloom_file,1024,"keyhunt_bsgs_6_%" PRIu64 ".blm",bsgs_m2);
 			fd_aux2 = fopen(buffer_bloom_file,"rb");
 			if(fd_aux2 != NULL)	{
+				apply_large_file_buffer(fd_aux2);
 				printf("[+] Reading bloom filter from file %s ",buffer_bloom_file);
 				fflush(stdout);
 				for(i = 0; i < 256;i++)	{
@@ -1492,21 +1546,16 @@ rseed(generate_seed());
 						fprintf(stderr,"[E] Error reading the file %s\n",buffer_bloom_file);
 						exit(EXIT_FAILURE);
 					}
-					memset(rawvalue,0,32);
-					if(FLAGSKIPCHECKSUM == 0)	{								
-						sha256((uint8_t*)bloom_bPx2nd[i].bf,bloom_bPx2nd[i].bytes,(uint8_t*)rawvalue);
-						if(memcmp(bloom_bPx2nd_checksums[i].data,rawvalue,32) != 0 || memcmp(bloom_bPx2nd_checksums[i].backup,rawvalue,32) != 0 )	{		/* Verification */
-							fprintf(stderr,"[E] Error checksum file mismatch! %s\n",buffer_bloom_file);
-							exit(EXIT_FAILURE);
-						}
-					}
 					if(i % 64 == 0)	{
 						printf(".");
 						fflush(stdout);
 					}
 				}
-				fclose(fd_aux2);
 				printf(" Done!\n");
+				if(!verify_bloom_checksums_parallel(bloom_bPx2nd, bloom_bPx2nd_checksums, 256, buffer_bloom_file)) {
+					exit(EXIT_FAILURE);
+				}
+				fclose(fd_aux2);
 				memset(buffer_bloom_file,0,1024);
 				snprintf(buffer_bloom_file,1024,"keyhunt_bsgs_5_%" PRIu64 ".blm",bsgs_m2);
 				fd_aux2 = fopen(buffer_bloom_file,"rb");
@@ -1559,45 +1608,47 @@ rseed(generate_seed());
 			}
 			
 			/*Reading file for 3rd bloom filter */
+			/*Reading file for 3rd bloom filter */
 			snprintf(buffer_bloom_file,1024,"keyhunt_bsgs_7_%" PRIu64 ".blm",bsgs_m3);
 			fd_aux2 = fopen(buffer_bloom_file,"rb");
 			if(fd_aux2 != NULL)	{
+				apply_large_file_buffer(fd_aux2);
 				printf("[+] Reading bloom filter from file %s ",buffer_bloom_file);
 				fflush(stdout);
-				for(i = 0; i < 256;i++)	{
+				for(i = 0; i < 256;i++) {
 					bf_ptr = (char*) bloom_bPx3rd[i].bf;	/*We need to save the current bf pointer*/
 					readed = fread(&bloom_bPx3rd[i],sizeof(struct bloom),1,fd_aux2);
-					if(readed != 1)	{
+					if(readed != 1) {
 						fprintf(stderr,"[E] Error reading the file %s\n",buffer_bloom_file);
 						exit(EXIT_FAILURE);
 					}
 					bloom_bPx3rd[i].bf = (uint8_t*)bf_ptr;	/* Restoring the bf pointer*/
 					readed = fread(bloom_bPx3rd[i].bf,bloom_bPx3rd[i].bytes,1,fd_aux2);
-					if(readed != 1)	{
+					if(readed != 1) {
 						fprintf(stderr,"[E] Error reading the file %s\n",buffer_bloom_file);
 						exit(EXIT_FAILURE);
 					}
 					readed = fread(&bloom_bPx3rd_checksums[i],sizeof(struct checksumsha256),1,fd_aux2);
-					if(readed != 1)	{
+					if(readed != 1) {
 						fprintf(stderr,"[E] Error reading the file %s\n",buffer_bloom_file);
 						exit(EXIT_FAILURE);
 					}
-					memset(rawvalue,0,32);
-					if(FLAGSKIPCHECKSUM == 0)	{							
-						sha256((uint8_t*)bloom_bPx3rd[i].bf,bloom_bPx3rd[i].bytes,(uint8_t*)rawvalue);
-						if(memcmp(bloom_bPx3rd_checksums[i].data,rawvalue,32) != 0 || memcmp(bloom_bPx3rd_checksums[i].backup,rawvalue,32) != 0 )	{		/* Verification */
-							fprintf(stderr,"[E] Error checksum file mismatch! %s\n",buffer_bloom_file);
-							exit(EXIT_FAILURE);
-						}
-					}
-					if(i % 64 == 0)	{
+					if(i % 64 == 0) {
 						printf(".");
 						fflush(stdout);
 					}
 				}
-				fclose(fd_aux2);
 				printf(" Done!\n");
+				if(!verify_bloom_checksums_parallel(bloom_bPx3rd, bloom_bPx3rd_checksums, 256, buffer_bloom_file)) {
+					exit(EXIT_FAILURE);
+				}
+				fclose(fd_aux2);
 				FLAGREADEDFILE4 = 1;
+			}
+			else	{
+				FLAGREADEDFILE4 = 0;
+			}
+
 			}
 			else	{
 				FLAGREADEDFILE4 = 0;
