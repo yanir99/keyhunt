@@ -10,6 +10,8 @@ email: albertobsd@gmail.com
 #include <math.h>
 #include <time.h>
 #include <vector>
+#include <array>
+#include <chrono>
 #include <inttypes.h>
 #include "base58/libbase58.h"
 #include "rmd160/rmd160.h"
@@ -31,6 +33,7 @@ email: albertobsd@gmail.com
 #include <pthread.h>
 #include <sys/random.h>
 #include <linux/random.h>
+#include <fcntl.h>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -191,9 +194,41 @@ char *range_end;
 char *str_stride;
 Int stride;
 
-uint64_t BSGS_XVALUE_RAM = 6;
-uint64_t BSGS_BUFFERXPOINTLENGTH = 32;
-uint64_t BSGS_BUFFERREGISTERLENGTH = 36;
+const uint64_t BSGS_XVALUE_RAM = 6;
+const uint64_t BSGS_BUFFERXPOINTLENGTH = 32;
+const uint64_t BSGS_BUFFERREGISTERLENGTH = 36;
+
+static unsigned long generate_seed() {
+        unsigned long seed = 0;
+        ssize_t bytes_read = getrandom(&seed, sizeof(seed), GRND_NONBLOCK);
+        if (bytes_read == (ssize_t)sizeof(seed)) {
+                return seed;
+        }
+
+        int fd = open("/dev/urandom", O_RDONLY);
+        if (fd >= 0) {
+                ssize_t r = read(fd, &seed, sizeof(seed));
+                close(fd);
+                if (r == (ssize_t)sizeof(seed)) {
+                        return seed;
+                }
+        }
+
+        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        seed ^= static_cast<unsigned long>(now);
+        seed ^= static_cast<unsigned long>(reinterpret_cast<uintptr_t>(&seed));
+        seed ^= static_cast<unsigned long>(getpid());
+        return seed;
+}
+
+static uint64_t compute_shard_entries(uint64_t total_elements, uint64_t minimum) {
+        uint64_t shard = (total_elements + 255ULL) / 256ULL;
+        return (shard < minimum) ? minimum : shard;
+}
+
+const long double BLOOM_ERROR_MAIN = 0.00000001L; // 1e-8
+const long double BLOOM_ERROR_SECOND = 0.000005L; // 5e-6
+const long double BLOOM_ERROR_THIRD = 0.000025L; // 2.5e-5
 
 /*
 BSGS Variables
@@ -311,11 +346,9 @@ int main(int argc, char **argv)	{
 	size_t rsize;
 
 	
-	pthread_mutex_init(&write_keys,NULL);
-	pthread_mutex_init(&write_random,NULL);
-	pthread_mutex_init(&mutex_bsgs_thread,NULL);
-
-	srand(time(NULL));
+        pthread_mutex_init(&write_keys,NULL);
+        pthread_mutex_init(&write_random,NULL);
+        pthread_mutex_init(&mutex_bsgs_thread,NULL);
 
 	secp = new Secp256K1();
 	secp->Init();
@@ -323,24 +356,7 @@ int main(int argc, char **argv)	{
 	ONE.SetInt32(1);
 	BSGS_GROUP_SIZE.SetInt32(CPU_GRP_SIZE);
 	
-	unsigned long rseedvalue;
-	int bytes_read = getrandom(&rseedvalue, sizeof(unsigned long), GRND_NONBLOCK);
-	if(bytes_read > 0)	{
-		rseed(rseedvalue);
-		/*
-		In any case that seed is for a failsafe RNG, the default source on linux is getrandom function
-		See https://www.2uo.de/myths-about-urandom/
-		*/
-	}
-	else	{
-		/*
-			what year is??
-			WTF linux without RNG ? 
-		*/
-		fprintf(stderr,"[E] Error getrandom() ?\n");
-		exit(0);
-		rseed(clock() + time(NULL) + rand()*rand());
-	}
+	rseed(generate_seed());
 	
 	port = PORT;
 	IP = (char*)ip_default;
@@ -517,34 +533,9 @@ int main(int argc, char **argv)	{
 
 
 		
-		if(((uint64_t)(bsgs_m/256)) > 10000)	{
-			itemsbloom = (uint64_t)(bsgs_m / 256);
-			if(bsgs_m % 256 != 0 )	{
-				itemsbloom++;
-			}
-		}
-		else{
-			itemsbloom = 1000;
-		}
-		
-		if(((uint64_t)(bsgs_m2/256)) > 1000)	{
-			itemsbloom2 = (uint64_t)(bsgs_m2 / 256);
-			if(bsgs_m2 % 256 != 0)	{
-				itemsbloom2++;
-			}
-		}
-		else	{
-			itemsbloom2 = 1000;
-		}
-		
-		if(((uint64_t)(bsgs_m3/256)) > 1000)	{
-			itemsbloom3 = (uint64_t)(bsgs_m3/256);
-			if(bsgs_m3 % 256 != 0 )	{
-				itemsbloom3++;
-			}
-		}
-		else	{
-			itemsbloom3 = 1000;
+		itemsbloom = compute_shard_entries(bsgs_m, 1000);
+		itemsbloom2 = compute_shard_entries(bsgs_m2, 1000);
+		itemsbloom3 = compute_shard_entries(bsgs_m3, 1000);
 		}
 		
 		printf("[+] Bloom filter for %" PRIu64 " elements ",bsgs_m);
@@ -561,7 +552,7 @@ int main(int argc, char **argv)	{
 		bloom_bP_totalbytes = 0;
 		for(i=0; i< 256; i++)	{
 			pthread_mutex_init(&bloom_bP_mutex[i],NULL);
-			if(bloom_init2(&bloom_bP[i],itemsbloom,0.000001)	== 1){
+			if(bloom_init2(&bloom_bP[i],itemsbloom,BLOOM_ERROR_MAIN)	== 1){
 				fprintf(stderr,"[E] error bloom_init _ %i\n",i);
 				exit(0);
 			}
@@ -581,7 +572,7 @@ int main(int argc, char **argv)	{
 		bloom_bP2_totalbytes = 0;
 		for(i=0; i< 256; i++)	{
 			pthread_mutex_init(&bloom_bPx2nd_mutex[i],NULL);
-			if(bloom_init2(&bloom_bPx2nd[i],itemsbloom2,0.000001)	== 1){
+			if(bloom_init2(&bloom_bPx2nd[i],itemsbloom2,BLOOM_ERROR_SECOND)	== 1){
 				fprintf(stderr,"[E] error bloom_init _ %i\n",i);
 				exit(0);
 			}
@@ -601,7 +592,7 @@ int main(int argc, char **argv)	{
 		bloom_bP3_totalbytes = 0;
 		for(i=0; i< 256; i++)	{
 			pthread_mutex_init(&bloom_bPx3rd_mutex[i],NULL);
-			if(bloom_init2(&bloom_bPx3rd[i],itemsbloom3,0.000001)	== 1){
+			if(bloom_init2(&bloom_bPx3rd[i],itemsbloom3,BLOOM_ERROR_THIRD)	== 1){
 				fprintf(stderr,"[E] error bloom_init %i\n",i);
 				exit(0);
 			}
@@ -1292,7 +1283,6 @@ int main(int argc, char **argv)	{
 				}
 			}
 		}
-	}
 	/* 
 		Here we already finish the BSGS setup
 		- Baby table and bloom filters are alrady setup
@@ -1972,7 +1962,29 @@ void *thread_bPload(void *vargp)	{
 	Point pts[CPU_GRP_SIZE];
 	Int dy,dyn,_s,_p;
 	Point pp,pn;
-	
+	typedef std::array<uint8_t, BSGS_BUFFERXPOINTLENGTH> BloomBuffer;
+	std::array<std::vector<BloomBuffer>, 256> shardBuffersPrimary;
+	std::array<std::vector<BloomBuffer>, 256> shardBuffersSecond;
+	std::array<std::vector<BloomBuffer>, 256> shardBuffersThird;
+	auto clear_buffers = [](auto &buffers) {
+		for(auto &vec : buffers) {
+			vec.clear();
+		}
+	};
+	auto flush_buffers = [](auto &buffers, pthread_mutex_t *mutexes, struct bloom *blooms) {
+		for(size_t shard = 0; shard < buffers.size(); ++shard) {
+			auto &vec = buffers[shard];
+			if(vec.empty()) {
+				continue;
+			}
+			pthread_mutex_lock(&mutexes[shard]);
+			for(const auto &entry : vec) {
+				bloom_add(&blooms[shard], entry.data(), BSGS_BUFFERXPOINTLENGTH);
+			}
+			pthread_mutex_unlock(&mutexes[shard]);
+		}
+	};
+
 	int i,bloom_bP_index,hLength = (CPU_GRP_SIZE / 2 - 1) ,threadid;
 	tt = (struct bPload *)vargp;
 	Int km((uint64_t)(tt->from + 1));
@@ -2068,32 +2080,37 @@ void *thread_bPload(void *vargp)	{
 #endif
 
 		pts[0] = pn;
+		clear_buffers(shardBuffersPrimary);
+		clear_buffers(shardBuffersSecond);
+		clear_buffers(shardBuffersThird);
+
+
 		for(j=0;j<CPU_GRP_SIZE;j++)	{
 			pts[j].x.Get32Bytes((unsigned char*)rawvalue);
 			bloom_bP_index = (uint8_t)rawvalue[0];
-
-			if(i_counter < bsgs_m3)	{
-				if(!FLAGREADEDFILE3)	{
+			if(i_counter < bsgs_m3) {
+				if(!FLAGREADEDFILE3)    {
 					memcpy(bPtable[i_counter].value,rawvalue+16,BSGS_XVALUE_RAM);
 					bPtable[i_counter].index = i_counter;
 				}
-				if(!FLAGREADEDFILE4)	{
-					pthread_mutex_lock(&bloom_bPx3rd_mutex[bloom_bP_index]);
-					bloom_add(&bloom_bPx3rd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
-					pthread_mutex_unlock(&bloom_bPx3rd_mutex[bloom_bP_index]);
+				if(!FLAGREADEDFILE4)    {
+					BloomBuffer value;
+					memcpy(value.data(), rawvalue, BSGS_BUFFERXPOINTLENGTH);
+					shardBuffersThird[bloom_bP_index].push_back(value);
 				}
 			}
-			if(i_counter < bsgs_m2 && !FLAGREADEDFILE2)	{
-				pthread_mutex_lock(&bloom_bPx2nd_mutex[bloom_bP_index]);
-				bloom_add(&bloom_bPx2nd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
-				pthread_mutex_unlock(&bloom_bPx2nd_mutex[bloom_bP_index]);
-			}
-			if(i_counter < to && !FLAGREADEDFILE1 )	{
-				pthread_mutex_lock(&bloom_bP_mutex[bloom_bP_index]);
-				bloom_add(&bloom_bP[bloom_bP_index], rawvalue ,BSGS_BUFFERXPOINTLENGTH);
-				pthread_mutex_unlock(&bloom_bP_mutex[bloom_bP_index]);
+			if(i_counter < bsgs_m2 && !FLAGREADEDFILE2)     {
+				BloomBuffer value;
+				memcpy(value.data(), rawvalue, BSGS_BUFFERXPOINTLENGTH);
+				shardBuffersSecond[bloom_bP_index].push_back(value);
 			}
 			i_counter++;
+		}
+		if(!FLAGREADEDFILE4) {
+			flush_buffers(shardBuffersThird, bloom_bPx3rd_mutex, bloom_bPx3rd);
+		}
+		if(!FLAGREADEDFILE2) {
+			flush_buffers(shardBuffersSecond, bloom_bPx2nd_mutex, bloom_bPx2nd);
 		}
 		// Next start point (startP + GRP_SIZE*G)
 		pp = startP;
@@ -2129,6 +2146,27 @@ void *thread_bPload_2blooms(void *vargp)	{
 	Point pts[CPU_GRP_SIZE];
 	Int dy,dyn,_s,_p;
 	Point pp,pn;
+	typedef std::array<uint8_t, BSGS_BUFFERXPOINTLENGTH> BloomBuffer;
+	std::array<std::vector<BloomBuffer>, 256> shardBuffersSecond;
+	std::array<std::vector<BloomBuffer>, 256> shardBuffersThird;
+	auto clear_buffers = [](auto &buffers) {
+		for(auto &vec : buffers) {
+			vec.clear();
+		}
+	};
+	auto flush_buffers = [](auto &buffers, pthread_mutex_t *mutexes, struct bloom *blooms) {
+		for(size_t shard = 0; shard < buffers.size(); ++shard) {
+			auto &vec = buffers[shard];
+			if(vec.empty()) {
+				continue;
+			}
+			pthread_mutex_lock(&mutexes[shard]);
+			for(const auto &entry : vec) {
+				bloom_add(&blooms[shard], entry.data(), BSGS_BUFFERXPOINTLENGTH);
+			}
+			pthread_mutex_unlock(&mutexes[shard]);
+		}
+	};
 	int i,bloom_bP_index,hLength = (CPU_GRP_SIZE / 2 - 1) ,threadid;
 	tt = (struct bPload *)vargp;
 	Int km((uint64_t)(tt->from +1 ));
@@ -2222,26 +2260,35 @@ void *thread_bPload_2blooms(void *vargp)	{
 #endif
 
 		pts[0] = pn;
-		for(j=0;j<CPU_GRP_SIZE;j++)	{
+		clear_buffers(shardBuffersSecond);
+		clear_buffers(shardBuffersThird);
+
+		for(j=0;j<CPU_GRP_SIZE;j++)     {
 			pts[j].x.Get32Bytes((unsigned char*)rawvalue);
 			bloom_bP_index = (uint8_t)rawvalue[0];
-			if(i_counter < bsgs_m3)	{
-				if(!FLAGREADEDFILE3)	{
+			if(i_counter < bsgs_m3) {
+				if(!FLAGREADEDFILE3)    {
 					memcpy(bPtable[i_counter].value,rawvalue+16,BSGS_XVALUE_RAM);
 					bPtable[i_counter].index = i_counter;
 				}
-				if(!FLAGREADEDFILE4)	{
-					pthread_mutex_lock(&bloom_bPx3rd_mutex[bloom_bP_index]);
-					bloom_add(&bloom_bPx3rd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
-					pthread_mutex_unlock(&bloom_bPx3rd_mutex[bloom_bP_index]);
+				if(!FLAGREADEDFILE4)    {
+					BloomBuffer value;
+					memcpy(value.data(), rawvalue, BSGS_BUFFERXPOINTLENGTH);
+					shardBuffersThird[bloom_bP_index].push_back(value);
 				}
 			}
-			if(i_counter < bsgs_m2 && !FLAGREADEDFILE2)	{
-				pthread_mutex_lock(&bloom_bPx2nd_mutex[bloom_bP_index]);
-				bloom_add(&bloom_bPx2nd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
-				pthread_mutex_unlock(&bloom_bPx2nd_mutex[bloom_bP_index]);
+			if(i_counter < bsgs_m2 && !FLAGREADEDFILE2)     {
+				BloomBuffer value;
+				memcpy(value.data(), rawvalue, BSGS_BUFFERXPOINTLENGTH);
+				shardBuffersSecond[bloom_bP_index].push_back(value);
 			}
 			i_counter++;
+		}
+		if(!FLAGREADEDFILE4) {
+			flush_buffers(shardBuffersThird, bloom_bPx3rd_mutex, bloom_bPx3rd);
+		}
+		if(!FLAGREADEDFILE2) {
+			flush_buffers(shardBuffersSecond, bloom_bPx2nd_mutex, bloom_bPx2nd);
 		}
 		// Next start point (startP + GRP_SIZE*G)
 		pp = startP;

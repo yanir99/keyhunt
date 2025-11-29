@@ -10,6 +10,8 @@ email: albertobsd@gmail.com
 #include <math.h>
 #include <time.h>
 #include <vector>
+#include <array>
+#include <chrono>
 #include <inttypes.h>
 #include "base58/libbase58.h"
 #include "rmd160/rmd160.h"
@@ -34,6 +36,7 @@ email: albertobsd@gmail.com
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/random.h>
+#include <fcntl.h>
 #endif
 
 #ifdef __unix__
@@ -315,9 +318,48 @@ char *range_end;
 char *str_stride;
 Int stride;
 
-uint64_t BSGS_XVALUE_RAM = 6;
-uint64_t BSGS_BUFFERXPOINTLENGTH = 32;
-uint64_t BSGS_BUFFERREGISTERLENGTH = 36;
+const uint64_t BSGS_XVALUE_RAM = 6;
+const uint64_t BSGS_BUFFERXPOINTLENGTH = 32;
+const uint64_t BSGS_BUFFERREGISTERLENGTH = 36;
+
+static unsigned long generate_seed() {
+#if defined(_WIN64) && !defined(__CYGWIN__)
+        unsigned long seed = static_cast<unsigned long>(GetTickCount64());
+        seed ^= static_cast<unsigned long>(GetCurrentProcessId());
+        seed ^= static_cast<unsigned long>(reinterpret_cast<uintptr_t>(&seed));
+        return seed;
+#else
+        unsigned long seed = 0;
+        ssize_t bytes_read = getrandom(&seed, sizeof(seed), GRND_NONBLOCK);
+        if (bytes_read == (ssize_t)sizeof(seed)) {
+                return seed;
+        }
+
+        int fd = open("/dev/urandom", O_RDONLY);
+        if (fd >= 0) {
+                ssize_t r = read(fd, &seed, sizeof(seed));
+                close(fd);
+                if (r == (ssize_t)sizeof(seed)) {
+                        return seed;
+                }
+        }
+
+        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        seed ^= static_cast<unsigned long>(now);
+        seed ^= static_cast<unsigned long>(reinterpret_cast<uintptr_t>(&seed));
+        seed ^= static_cast<unsigned long>(getpid());
+        return seed;
+#endif
+}
+
+static uint64_t compute_shard_entries(uint64_t total_elements, uint64_t minimum) {
+        uint64_t shard = (total_elements + 255ULL) / 256ULL;
+        return (shard < minimum) ? minimum : shard;
+}
+
+const long double BLOOM_ERROR_MAIN = 0.00000001L; // 1e-8
+const long double BLOOM_ERROR_SECOND = 0.000005L; // 5e-6
+const long double BLOOM_ERROR_THIRD = 0.000025L; // 2.5e-5
 
 /*
 BSGS Variables
@@ -449,7 +491,6 @@ int main(int argc, char **argv)	{
 	int s;
 #endif
 
-	srand(time(NULL));
 
 	secp = new Secp256K1();
 	secp->Init();
@@ -458,29 +499,7 @@ int main(int argc, char **argv)	{
 	ONE.SetInt32(1);
 	BSGS_GROUP_SIZE.SetInt32(CPU_GRP_SIZE);
 	
-#if defined(_WIN64) && !defined(__CYGWIN__)
-	//Any windows secure random source goes here
-	rseed(clock() + time(NULL) + rand());
-#else
-	unsigned long rseedvalue;
-	int bytes_read = getrandom(&rseedvalue, sizeof(unsigned long), GRND_NONBLOCK);
-	if(bytes_read > 0)	{
-		rseed(rseedvalue);
-		/*
-		In any case that seed is for a failsafe RNG, the default source on linux is getrandom function
-		See https://www.2uo.de/myths-about-urandom/
-		*/
-	}
-	else	{
-		/*
-			what year is??
-			WTF linux without RNG ? 
-		*/
-		fprintf(stderr,"[E] Error getrandom() ?\n");
-		exit(EXIT_FAILURE);
-		rseed(clock() + time(NULL) + rand()*rand());
-	}
-#endif
+rseed(generate_seed());
 	
 	
 	
@@ -1182,36 +1201,10 @@ int main(int argc, char **argv)	{
 		hextemp = BSGS_N.GetBase16();
 		printf("[+] N = 0x%s\n",hextemp);
 		free(hextemp);
-		if(((uint64_t)(bsgs_m/256)) > 10000)	{
-			itemsbloom = (uint64_t)(bsgs_m / 256);
-			if(bsgs_m % 256 != 0 )	{
-				itemsbloom++;
-			}
-		}
-		else{
-			itemsbloom = 1000;
-		}
-		
-		if(((uint64_t)(bsgs_m2/256)) > 1000)	{
-			itemsbloom2 = (uint64_t)(bsgs_m2 / 256);
-			if(bsgs_m2 % 256 != 0)	{
-				itemsbloom2++;
-			}
-		}
-		else	{
-			itemsbloom2 = 1000;
-		}
-		
-		if(((uint64_t)(bsgs_m3/256)) > 1000)	{
-			itemsbloom3 = (uint64_t)(bsgs_m3/256);
-			if(bsgs_m3 % 256 != 0 )	{
-				itemsbloom3++;
-			}
-		}
-		else	{
-			itemsbloom3 = 1000;
-		}
-		
+		itemsbloom = compute_shard_entries(bsgs_m, 1000);
+		itemsbloom2 = compute_shard_entries(bsgs_m2, 1000);
+		itemsbloom3 = compute_shard_entries(bsgs_m3, 1000);
+
 		printf("[+] Bloom filter for %" PRIu64 " elements ",bsgs_m);
 		bloom_bP = (struct bloom*)calloc(256,sizeof(struct bloom));
 		checkpointer((void *)bloom_bP,__FILE__,"calloc","bloom_bP" ,__LINE__ -1 );
@@ -1235,7 +1228,7 @@ int main(int argc, char **argv)	{
 #else
 			pthread_mutex_init(&bloom_bP_mutex[i],NULL);
 #endif
-			if(bloom_init2(&bloom_bP[i],itemsbloom,0.000001)	== 1){
+			if(bloom_init2(&bloom_bP[i],itemsbloom,BLOOM_ERROR_MAIN)	== 1){
 				fprintf(stderr,"[E] error bloom_init _ [%" PRIu64 "]\n",i);
 				exit(EXIT_FAILURE);
 			}
@@ -1264,7 +1257,7 @@ int main(int argc, char **argv)	{
 #else
 			pthread_mutex_init(&bloom_bPx2nd_mutex[i],NULL);
 #endif
-			if(bloom_init2(&bloom_bPx2nd[i],itemsbloom2,0.000001)	== 1){
+			if(bloom_init2(&bloom_bPx2nd[i],itemsbloom2,BLOOM_ERROR_SECOND)	== 1){
 				fprintf(stderr,"[E] error bloom_init _ [%" PRIu64 "]\n",i);
 				exit(EXIT_FAILURE);
 			}
@@ -1293,7 +1286,7 @@ int main(int argc, char **argv)	{
 #else
 			pthread_mutex_init(&bloom_bPx3rd_mutex[i],NULL);
 #endif
-			if(bloom_init2(&bloom_bPx3rd[i],itemsbloom3,0.000001)	== 1){
+			if(bloom_init2(&bloom_bPx3rd[i],itemsbloom3,BLOOM_ERROR_THIRD)	== 1){
 				fprintf(stderr,"[E] error bloom_init [%" PRIu64 "]\n",i);
 				exit(EXIT_FAILURE);
 			}
