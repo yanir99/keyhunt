@@ -292,6 +292,8 @@ int FLAGDEBUG = 0;
 int FLAGQUIET = 0;
 int FLAGMATRIX = 0;
 int KFACTOR = 1;
+bool FLAG_USER_K = false;
+bool FLAG_USER_N = false;
 int MAXLENGTHADDRESS = -1;
 int NTHREADS = 1;
 
@@ -334,6 +336,10 @@ const long double BLOOM_GIGABYTE = 1073741824.0L;
 
 long double bloom_error_main_active = BLOOM_ERROR_MAIN;
 long double bsgs_bloom_target_gb = 0.0L;
+
+static inline long double bloom_min_bpe_limit() {
+        return -logl(LDBL_MIN) / BLOOM_LN2_SQUARED;
+}
 
 static unsigned long generate_seed() {
 #if defined(_WIN64) && !defined(__CYGWIN__)
@@ -699,6 +705,7 @@ rseed(generate_seed());
                         break;
 			case 'k':
 				KFACTOR = (int)strtol(optarg,NULL,10);
+				FLAG_USER_K = 1;
 				if(KFACTOR <= 0)	{
 					KFACTOR = 1;
 				}
@@ -769,6 +776,7 @@ rseed(generate_seed());
 			break;
 			case 'n':
 				FLAG_N = 1;
+				FLAG_USER_N = 1;
 				str_N = optarg;
 			break;
 			case 'q':
@@ -1180,6 +1188,43 @@ rseed(generate_seed());
 			exit(EXIT_FAILURE);
 		}
 
+		uint64_t bsgs_m_root = BSGS_M.GetInt64();
+
+		if(bsgs_bloom_target_gb > 0.0L) {
+			long double target_bytes = bsgs_bloom_target_gb * BLOOM_GIGABYTE;
+			long double target_per_bloom = target_bytes / 256.0L;
+			long double min_bpe_for_underflow = bloom_min_bpe_limit();
+
+			long double desired_entries_ld = ceill((target_per_bloom * 8.0L) / min_bpe_for_underflow);
+			if(desired_entries_ld < 1000.0L) {
+				desired_entries_ld = 1000.0L;
+			}
+
+			uint64_t desired_entries = (uint64_t)desired_entries_ld;
+			uint64_t desired_m = desired_entries * 256ULL;
+			uint64_t tuned_k = (desired_m + bsgs_m_root - 1ULL) / bsgs_m_root;
+			if(tuned_k == 0) {
+				tuned_k = 1;
+			}
+
+                        if(!FLAG_USER_K) {
+                                KFACTOR = (int)tuned_k;
+                                printf("[+] Auto-adjusted K factor to %i for %.2Lf GB bloom target\n", KFACTOR, bsgs_bloom_target_gb);
+                        }
+                        else if(tuned_k > (uint64_t)KFACTOR) {
+                                printf("[W] Provided K factor %i is below the value %" PRIu64 " suggested for the bloom budget\n", KFACTOR, tuned_k);
+                        }
+
+			if(!FLAG_USER_N) {
+				BSGS_N.SetInt64(bsgs_m_root);
+				BSGS_N.Mult((uint64_t)bsgs_m_root);
+				BSGS_N.Mult((uint64_t)tuned_k);
+				BSGS_N.Mult((uint64_t)tuned_k);
+				printf("[+] Auto-adjusted N to match bloom target sizing\n");
+			}
+		}
+
+
 		BSGS_AUX.Set(&BSGS_M);
 		BSGS_AUX.Mod(&BSGS_GROUP_SIZE);	
 		
@@ -1291,15 +1336,15 @@ rseed(generate_seed());
                 itemsbloom2 = compute_shard_entries(bsgs_m2, 1000);
                 itemsbloom3 = compute_shard_entries(bsgs_m3, 1000);
 
-                if(bsgs_bloom_target_gb > 0.0L) {
-                        long double base_main_bytes = estimate_bloom_bytes(itemsbloom, BLOOM_ERROR_MAIN) * 256.0L;
-                        long double target_bytes = bsgs_bloom_target_gb * BLOOM_GIGABYTE;
-                        long double target_per_bloom = target_bytes / 256.0L;
-                        long double bits_per_entry_budget = (target_per_bloom * 8.0L) / static_cast<long double>(itemsbloom);
+                        if(bsgs_bloom_target_gb > 0.0L) {
+                                long double base_main_bytes = estimate_bloom_bytes(itemsbloom, BLOOM_ERROR_MAIN) * 256.0L;
+                                long double target_bytes = bsgs_bloom_target_gb * BLOOM_GIGABYTE;
+                                long double target_per_bloom = target_bytes / 256.0L;
+                                long double bits_per_entry_budget = (target_per_bloom * 8.0L) / static_cast<long double>(itemsbloom);
 
-                        if(bits_per_entry_budget > 0.0L) {
-                                long double capped_error;
-                                long double min_bpe_for_underflow = -logl(LDBL_MIN) / BLOOM_LN2_SQUARED;
+                                if(bits_per_entry_budget > 0.0L) {
+                                        long double capped_error;
+                                        long double min_bpe_for_underflow = bloom_min_bpe_limit();
 
                                 if(bits_per_entry_budget >= min_bpe_for_underflow) {
                                         capped_error = LDBL_MIN;
@@ -5856,7 +5901,7 @@ void menu() {
         printf("-8 alpha    Set the bas58 alphabet for minikeys\n");
         printf("-e          Enable endomorphism search (Only for address, rmd160 and vanity)\n");
         printf("-f file     Specify file name with addresses or xpoints or uncompressed public keys\n");
-        printf("-G gb       Target gigabytes for the main BSGS bloom (adjusts false-positive rate)\n");
+printf("-G gb       Target gigabytes for the main BSGS bloom (auto-tunes k/n and false-positive rate)\n");
         printf("-I stride   Stride for xpoint, rmd160 and address, this option don't work with bsgs\n");
         printf("-k value    Use this only with bsgs mode, k value is factor for M, more speed but more RAM use wisely\n");
         printf("-l look     What type of address/hash160 are you looking for <compress, uncompress, both> Only for rmd160 and address\n");
