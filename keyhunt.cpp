@@ -8,6 +8,7 @@ email: albertobsd@gmail.com
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include <time.h>
 #include <vector>
 #include <array>
@@ -1297,10 +1298,24 @@ rseed(generate_seed());
                         long double bits_per_entry_budget = (target_per_bloom * 8.0L) / static_cast<long double>(itemsbloom);
 
                         if(bits_per_entry_budget > 0.0L) {
-                                long double tuned_error = expl(-bits_per_entry_budget * BLOOM_LN2_SQUARED);
-                                if(tuned_error > 0.0L && tuned_error < 1.0L) {
-                                        bloom_error_main_active = tuned_error;
-                                        printf("[+] Tuning main bloom error to %.12Lf for ~%.2Lf GB (default %.2Lf GB)\n", bloom_error_main_active, target_bytes / BLOOM_GIGABYTE, base_main_bytes / BLOOM_GIGABYTE);
+                                long double capped_error;
+                                long double min_bpe_for_underflow = -logl(LDBL_MIN) / BLOOM_LN2_SQUARED;
+
+                                if(bits_per_entry_budget >= min_bpe_for_underflow) {
+                                        capped_error = LDBL_MIN;
+                                }
+                                else {
+                                        capped_error = expl(-bits_per_entry_budget * BLOOM_LN2_SQUARED);
+                                }
+
+                                if(capped_error > 0.0L && capped_error < 1.0L) {
+                                        bloom_error_main_active = capped_error;
+                                        if(capped_error == LDBL_MIN) {
+                                                printf("[+] Tuning main bloom error to %.12Lf (minimum representable) for ~%.2Lf GB (default %.2Lf GB)\n", bloom_error_main_active, target_bytes / BLOOM_GIGABYTE, base_main_bytes / BLOOM_GIGABYTE);
+                                        }
+                                        else {
+                                                printf("[+] Tuning main bloom error to %.12Lf for ~%.2Lf GB (default %.2Lf GB)\n", bloom_error_main_active, target_bytes / BLOOM_GIGABYTE, base_main_bytes / BLOOM_GIGABYTE);
+                                        }
                                 }
                                 else {
                                         fprintf(stderr,"[W] Requested bloom budget could not produce a valid error rate; keeping default.\n");
