@@ -1934,6 +1934,7 @@ rseed(generate_seed());
 				
 				fd_aux1 = fopen(buffer_bloom_file,"wb");
 				if(fd_aux1 != NULL)	{
+					apply_large_file_buffer(fd_aux1);
 					printf("[+] Writing bloom filter to file %s ",buffer_bloom_file);
 					fflush(stdout);
 					for(i = 0; i < 256;i++)	{
@@ -1972,6 +1973,7 @@ rseed(generate_seed());
 				/* Writing file for 2nd bloom filter */
 				fd_aux2 = fopen(buffer_bloom_file,"wb");
 				if(fd_aux2 != NULL)	{
+					apply_large_file_buffer(fd_aux2);
 					printf("[+] Writing bloom filter to file %s ",buffer_bloom_file);
 					fflush(stdout);
 					for(i = 0; i < 256;i++)	{
@@ -2009,6 +2011,7 @@ rseed(generate_seed());
 				snprintf(buffer_bloom_file,1024,"keyhunt_bsgs_2_%" PRIu64 ".tbl",bsgs_m3);
 				fd_aux3 = fopen(buffer_bloom_file,"wb");
 				if(fd_aux3 != NULL)	{
+					apply_large_file_buffer(fd_aux3);
 					printf("[+] Writing bP Table to file %s .. ",buffer_bloom_file);
 					fflush(stdout);
 					readed = fwrite(bPtable,bytes,1,fd_aux3);
@@ -2035,6 +2038,7 @@ rseed(generate_seed());
 				/* Writing file for 3rd bloom filter */
 				fd_aux2 = fopen(buffer_bloom_file,"wb");
 				if(fd_aux2 != NULL)	{
+					apply_large_file_buffer(fd_aux2);
 					printf("[+] Writing bloom filter to file %s ",buffer_bloom_file);
 					fflush(stdout);
 					for(i = 0; i < 256;i++)	{
@@ -4451,7 +4455,7 @@ void *thread_bPload(void *vargp)	{
 	char rawvalue[32];
 	struct bPload *tt;
 	uint64_t i_counter,j,nbStep,to;
-	
+
 	IntGroup *grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
 	Point startP;
 	Int dx[CPU_GRP_SIZE / 2 + 1];
