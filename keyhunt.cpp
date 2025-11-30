@@ -11,8 +11,11 @@ email: albertobsd@gmail.com
 #include <time.h>
 #include <vector>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <inttypes.h>
+#include <thread>
+#include <algorithm>
 #include "base58/libbase58.h"
 #include "rmd160/rmd160.h"
 #include "oldbloom/oldbloom.h"
@@ -322,6 +325,15 @@ const uint64_t BSGS_XVALUE_RAM = 6;
 const uint64_t BSGS_BUFFERXPOINTLENGTH = 32;
 const uint64_t BSGS_BUFFERREGISTERLENGTH = 36;
 
+const long double BLOOM_ERROR_MAIN = 0.00000001L; // 1e-8
+const long double BLOOM_ERROR_SECOND = 0.000005L; // 5e-6
+const long double BLOOM_ERROR_THIRD = 0.000025L; // 2.5e-5
+const long double BLOOM_LN2_SQUARED = 0.480453013918201L;
+const long double BLOOM_GIGABYTE = 1073741824.0L;
+
+long double bloom_error_main_active = BLOOM_ERROR_MAIN;
+long double bsgs_bloom_target_gb = 0.0L;
+
 static unsigned long generate_seed() {
 #if defined(_WIN64) && !defined(__CYGWIN__)
         unsigned long seed = static_cast<unsigned long>(GetTickCount64());
@@ -357,9 +369,72 @@ static uint64_t compute_shard_entries(uint64_t total_elements, uint64_t minimum)
         return (shard < minimum) ? minimum : shard;
 }
 
-const long double BLOOM_ERROR_MAIN = 0.00000001L; // 1e-8
-const long double BLOOM_ERROR_SECOND = 0.000005L; // 5e-6
-const long double BLOOM_ERROR_THIRD = 0.000025L; // 2.5e-5
+static long double estimate_bloom_bytes(uint64_t entries, long double error_rate) {
+        if(entries == 0 || error_rate <= 0.0L || error_rate >= 1.0L) {
+                return 0.0L;
+        }
+
+        long double bpe = -logl(error_rate) / BLOOM_LN2_SQUARED;
+        long double bits = static_cast<long double>(entries) * bpe;
+        long double bytes = bits / 8.0L;
+        if(fmodl(bits, 8.0L) != 0.0L) {
+                bytes += 1.0L;
+        }
+        return bytes;
+}
+
+static void apply_large_file_buffer(FILE *fd) {
+        if(fd != NULL) {
+                setvbuf(fd, NULL, _IOFBF, 16 * 1024 * 1024);
+        }
+}
+
+static bool verify_bloom_checksums_parallel(struct bloom *blooms, struct checksumsha256 *checksums, size_t count, const char *label) {
+        if(FLAGSKIPCHECKSUM) {
+                return true;
+        }
+
+        unsigned int workers = std::thread::hardware_concurrency();
+        if(workers == 0) {
+                workers = 4;
+        }
+
+        size_t chunk = (count + workers - 1) / workers;
+        std::atomic<bool> ok(true);
+        std::vector<std::thread> threads;
+        threads.reserve(workers);
+
+        auto verify_chunk = [&](size_t start, size_t end) {
+                uint8_t rawvalue[32];
+                for(size_t i = start; i < end && ok.load(std::memory_order_relaxed); ++i) {
+                        sha256((uint8_t*)blooms[i].bf, blooms[i].bytes, (uint8_t*)rawvalue);
+                        if(memcmp(checksums[i].data, rawvalue, 32) != 0 || memcmp(checksums[i].backup, rawvalue, 32) != 0) {
+                                ok.store(false, std::memory_order_relaxed);
+                                break;
+                        }
+                }
+        };
+
+        for(unsigned int t = 0; t < workers; ++t) {
+                size_t start = t * chunk;
+                if(start >= count) {
+                        break;
+                }
+                size_t end = std::min(count, start + chunk);
+                threads.emplace_back(verify_chunk, start, end);
+        }
+
+        for(auto &th : threads) {
+                if(th.joinable()) {
+                        th.join();
+                }
+        }
+
+        if(!ok.load()) {
+                fprintf(stderr,"[E] Error checksum file mismatch! %s\n",label);
+        }
+        return ok.load();
+}
 
 /*
 BSGS Variables
@@ -603,14 +678,24 @@ rseed(generate_seed());
 				beta.SetBase16("7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee");
 				beta2.SetBase16("851695d49a83f8ef919bb86153cbcb16630fb68aed0a766a3ec693d68e6afa40");
 			break;
-			case 'f':
-				FLAGFILE = 1;
-				fileName = optarg;
-			break;
-			case 'I':
-				FLAGSTRIDE = 1;
-				str_stride = optarg;
-			break;
+                        case 'f':
+                                FLAGFILE = 1;
+                                fileName = optarg;
+                        break;
+                        case 'G':
+                                bsgs_bloom_target_gb = strtold(optarg, NULL);
+                                if(bsgs_bloom_target_gb > 0.0L) {
+                                        printf("[+] Targeting %.2Lf GB for main BSGS bloom\n", bsgs_bloom_target_gb);
+                                }
+                                else    {
+                                        fprintf(stderr,"[E] Invalid bloom budget: %s\n", optarg);
+                                        exit(EXIT_FAILURE);
+                                }
+                        break;
+                        case 'I':
+                                FLAGSTRIDE = 1;
+                                str_stride = optarg;
+                        break;
 			case 'k':
 				KFACTOR = (int)strtol(optarg,NULL,10);
 				if(KFACTOR <= 0)	{
@@ -1198,12 +1283,32 @@ rseed(generate_seed());
 		BSGS_N_double.Mult(&BSGS_N);
 
 		
-		hextemp = BSGS_N.GetBase16();
-		printf("[+] N = 0x%s\n",hextemp);
-		free(hextemp);
-		itemsbloom = compute_shard_entries(bsgs_m, 1000);
-		itemsbloom2 = compute_shard_entries(bsgs_m2, 1000);
-		itemsbloom3 = compute_shard_entries(bsgs_m3, 1000);
+                hextemp = BSGS_N.GetBase16();
+                printf("[+] N = 0x%s\n",hextemp);
+                free(hextemp);
+                itemsbloom = compute_shard_entries(bsgs_m, 1000);
+                itemsbloom2 = compute_shard_entries(bsgs_m2, 1000);
+                itemsbloom3 = compute_shard_entries(bsgs_m3, 1000);
+
+                if(bsgs_bloom_target_gb > 0.0L) {
+                        long double base_main_bytes = estimate_bloom_bytes(itemsbloom, BLOOM_ERROR_MAIN) * 256.0L;
+                        long double target_bytes = bsgs_bloom_target_gb * BLOOM_GIGABYTE;
+                        if(target_bytes < base_main_bytes) {
+                                long double target_per_bloom = target_bytes / 256.0L;
+                                long double bits_per_entry_budget = (target_per_bloom * 8.0L) / static_cast<long double>(itemsbloom);
+                                long double tuned_error = expl(-bits_per_entry_budget * BLOOM_LN2_SQUARED);
+                                if(tuned_error > 0.0L && tuned_error < 1.0L) {
+                                        bloom_error_main_active = tuned_error;
+                                        printf("[+] Tuning main bloom error to %.12Lf for ~%.2Lf GB (default %.2Lf GB)\n", bloom_error_main_active, target_bytes / BLOOM_GIGABYTE, base_main_bytes / BLOOM_GIGABYTE);
+                                }
+                                else {
+                                        fprintf(stderr,"[W] Requested bloom budget is too small; keeping default error rate.\n");
+                                }
+                        }
+                        else {
+                                printf("[+] Requested bloom budget (%.2Lf GB) exceeds default use (%.2Lf GB); keeping default error.\n", target_bytes / BLOOM_GIGABYTE, base_main_bytes / BLOOM_GIGABYTE);
+                        }
+                }
 
 		printf("[+] Bloom filter for %" PRIu64 " elements ",bsgs_m);
 		bloom_bP = (struct bloom*)calloc(256,sizeof(struct bloom));
@@ -1228,7 +1333,7 @@ rseed(generate_seed());
 #else
 			pthread_mutex_init(&bloom_bP_mutex[i],NULL);
 #endif
-			if(bloom_init2(&bloom_bP[i],itemsbloom,BLOOM_ERROR_MAIN)	== 1){
+			if(bloom_init2(&bloom_bP[i],itemsbloom,bloom_error_main_active)	== 1){
 				fprintf(stderr,"[E] error bloom_init _ [%" PRIu64 "]\n",i);
 				exit(EXIT_FAILURE);
 			}
@@ -1369,6 +1474,7 @@ rseed(generate_seed());
 			snprintf(buffer_bloom_file,1024,"keyhunt_bsgs_4_%" PRIu64 ".blm",bsgs_m);
 			fd_aux1 = fopen(buffer_bloom_file,"rb");
 			if(fd_aux1 != NULL)	{
+				apply_large_file_buffer(fd_aux1);
 				printf("[+] Reading bloom filter from file %s ",buffer_bloom_file);
 				fflush(stdout);
 				for(i = 0; i < 256;i++)	{
@@ -1389,19 +1495,15 @@ rseed(generate_seed());
 						fprintf(stderr,"[E] Error reading the file %s\n",buffer_bloom_file);
 						exit(EXIT_FAILURE);
 					}
-					if(FLAGSKIPCHECKSUM == 0)	{
-						sha256((uint8_t*)bloom_bP[i].bf,bloom_bP[i].bytes,(uint8_t*)rawvalue);
-						if(memcmp(bloom_bP_checksums[i].data,rawvalue,32) != 0 || memcmp(bloom_bP_checksums[i].backup,rawvalue,32) != 0 )	{	/* Verification */
-							fprintf(stderr,"[E] Error checksum file mismatch! %s\n",buffer_bloom_file);
-							exit(EXIT_FAILURE);
-						}
-					}
 					if(i % 64 == 0 )	{
 						printf(".");
 						fflush(stdout);
 					}
 				}
 				printf(" Done!\n");
+				if(!verify_bloom_checksums_parallel(bloom_bP, bloom_bP_checksums, 256, buffer_bloom_file)) {
+					exit(EXIT_FAILURE);
+				}
 				fclose(fd_aux1);
 				memset(buffer_bloom_file,0,1024);
 				snprintf(buffer_bloom_file,1024,"keyhunt_bsgs_3_%" PRIu64 ".blm",bsgs_m);
@@ -1472,6 +1574,7 @@ rseed(generate_seed());
 			snprintf(buffer_bloom_file,1024,"keyhunt_bsgs_6_%" PRIu64 ".blm",bsgs_m2);
 			fd_aux2 = fopen(buffer_bloom_file,"rb");
 			if(fd_aux2 != NULL)	{
+				apply_large_file_buffer(fd_aux2);
 				printf("[+] Reading bloom filter from file %s ",buffer_bloom_file);
 				fflush(stdout);
 				for(i = 0; i < 256;i++)	{
@@ -1492,21 +1595,16 @@ rseed(generate_seed());
 						fprintf(stderr,"[E] Error reading the file %s\n",buffer_bloom_file);
 						exit(EXIT_FAILURE);
 					}
-					memset(rawvalue,0,32);
-					if(FLAGSKIPCHECKSUM == 0)	{								
-						sha256((uint8_t*)bloom_bPx2nd[i].bf,bloom_bPx2nd[i].bytes,(uint8_t*)rawvalue);
-						if(memcmp(bloom_bPx2nd_checksums[i].data,rawvalue,32) != 0 || memcmp(bloom_bPx2nd_checksums[i].backup,rawvalue,32) != 0 )	{		/* Verification */
-							fprintf(stderr,"[E] Error checksum file mismatch! %s\n",buffer_bloom_file);
-							exit(EXIT_FAILURE);
-						}
-					}
 					if(i % 64 == 0)	{
 						printf(".");
 						fflush(stdout);
 					}
 				}
-				fclose(fd_aux2);
 				printf(" Done!\n");
+				if(!verify_bloom_checksums_parallel(bloom_bPx2nd, bloom_bPx2nd_checksums, 256, buffer_bloom_file)) {
+					exit(EXIT_FAILURE);
+				}
+				fclose(fd_aux2);
 				memset(buffer_bloom_file,0,1024);
 				snprintf(buffer_bloom_file,1024,"keyhunt_bsgs_5_%" PRIu64 ".blm",bsgs_m2);
 				fd_aux2 = fopen(buffer_bloom_file,"rb");
@@ -1559,44 +1657,41 @@ rseed(generate_seed());
 			}
 			
 			/*Reading file for 3rd bloom filter */
+			/*Reading file for 3rd bloom filter */
 			snprintf(buffer_bloom_file,1024,"keyhunt_bsgs_7_%" PRIu64 ".blm",bsgs_m3);
 			fd_aux2 = fopen(buffer_bloom_file,"rb");
 			if(fd_aux2 != NULL)	{
+				apply_large_file_buffer(fd_aux2);
 				printf("[+] Reading bloom filter from file %s ",buffer_bloom_file);
 				fflush(stdout);
-				for(i = 0; i < 256;i++)	{
+				for(i = 0; i < 256;i++) {
 					bf_ptr = (char*) bloom_bPx3rd[i].bf;	/*We need to save the current bf pointer*/
 					readed = fread(&bloom_bPx3rd[i],sizeof(struct bloom),1,fd_aux2);
-					if(readed != 1)	{
+					if(readed != 1) {
 						fprintf(stderr,"[E] Error reading the file %s\n",buffer_bloom_file);
 						exit(EXIT_FAILURE);
 					}
 					bloom_bPx3rd[i].bf = (uint8_t*)bf_ptr;	/* Restoring the bf pointer*/
 					readed = fread(bloom_bPx3rd[i].bf,bloom_bPx3rd[i].bytes,1,fd_aux2);
-					if(readed != 1)	{
+					if(readed != 1) {
 						fprintf(stderr,"[E] Error reading the file %s\n",buffer_bloom_file);
 						exit(EXIT_FAILURE);
 					}
 					readed = fread(&bloom_bPx3rd_checksums[i],sizeof(struct checksumsha256),1,fd_aux2);
-					if(readed != 1)	{
+					if(readed != 1) {
 						fprintf(stderr,"[E] Error reading the file %s\n",buffer_bloom_file);
 						exit(EXIT_FAILURE);
 					}
-					memset(rawvalue,0,32);
-					if(FLAGSKIPCHECKSUM == 0)	{							
-						sha256((uint8_t*)bloom_bPx3rd[i].bf,bloom_bPx3rd[i].bytes,(uint8_t*)rawvalue);
-						if(memcmp(bloom_bPx3rd_checksums[i].data,rawvalue,32) != 0 || memcmp(bloom_bPx3rd_checksums[i].backup,rawvalue,32) != 0 )	{		/* Verification */
-							fprintf(stderr,"[E] Error checksum file mismatch! %s\n",buffer_bloom_file);
-							exit(EXIT_FAILURE);
-						}
-					}
-					if(i % 64 == 0)	{
+					if(i % 64 == 0) {
 						printf(".");
 						fflush(stdout);
 					}
 				}
-				fclose(fd_aux2);
 				printf(" Done!\n");
+				if(!verify_bloom_checksums_parallel(bloom_bPx3rd, bloom_bPx3rd_checksums, 256, buffer_bloom_file)) {
+					exit(EXIT_FAILURE);
+				}
+				fclose(fd_aux2);
 				FLAGREADEDFILE4 = 1;
 			}
 			else	{
@@ -1883,6 +1978,7 @@ rseed(generate_seed());
 				
 				fd_aux1 = fopen(buffer_bloom_file,"wb");
 				if(fd_aux1 != NULL)	{
+					apply_large_file_buffer(fd_aux1);
 					printf("[+] Writing bloom filter to file %s ",buffer_bloom_file);
 					fflush(stdout);
 					for(i = 0; i < 256;i++)	{
@@ -1921,6 +2017,7 @@ rseed(generate_seed());
 				/* Writing file for 2nd bloom filter */
 				fd_aux2 = fopen(buffer_bloom_file,"wb");
 				if(fd_aux2 != NULL)	{
+					apply_large_file_buffer(fd_aux2);
 					printf("[+] Writing bloom filter to file %s ",buffer_bloom_file);
 					fflush(stdout);
 					for(i = 0; i < 256;i++)	{
@@ -1958,6 +2055,7 @@ rseed(generate_seed());
 				snprintf(buffer_bloom_file,1024,"keyhunt_bsgs_2_%" PRIu64 ".tbl",bsgs_m3);
 				fd_aux3 = fopen(buffer_bloom_file,"wb");
 				if(fd_aux3 != NULL)	{
+					apply_large_file_buffer(fd_aux3);
 					printf("[+] Writing bP Table to file %s .. ",buffer_bloom_file);
 					fflush(stdout);
 					readed = fwrite(bPtable,bytes,1,fd_aux3);
@@ -1984,6 +2082,7 @@ rseed(generate_seed());
 				/* Writing file for 3rd bloom filter */
 				fd_aux2 = fopen(buffer_bloom_file,"wb");
 				if(fd_aux2 != NULL)	{
+					apply_large_file_buffer(fd_aux2);
 					printf("[+] Writing bloom filter to file %s ",buffer_bloom_file);
 					fflush(stdout);
 					for(i = 0; i < 256;i++)	{
@@ -4400,7 +4499,7 @@ void *thread_bPload(void *vargp)	{
 	char rawvalue[32];
 	struct bPload *tt;
 	uint64_t i_counter,j,nbStep,to;
-	
+
 	IntGroup *grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
 	Point startP;
 	Int dx[CPU_GRP_SIZE / 2 + 1];
@@ -5736,14 +5835,15 @@ void menu() {
 	printf("-h          show this help\n");
 	printf("-B Mode     BSGS now have some modes <sequential, backward, both, random, dance>\n");
 	printf("-b bits     For some puzzles you only need some numbers of bits in the test keys.\n");
-	printf("-c crypto   Search for specific crypto. <btc, eth> valid only w/ -m address\n");
-	printf("-C mini     Set the minikey Base only 22 character minikeys, ex: SRPqx8QiwnW4WNWnTVa2W5\n");
-	printf("-8 alpha    Set the bas58 alphabet for minikeys\n");
-	printf("-e          Enable endomorphism search (Only for address, rmd160 and vanity)\n");
-	printf("-f file     Specify file name with addresses or xpoints or uncompressed public keys\n");
-	printf("-I stride   Stride for xpoint, rmd160 and address, this option don't work with bsgs\n");
-	printf("-k value    Use this only with bsgs mode, k value is factor for M, more speed but more RAM use wisely\n");
-	printf("-l look     What type of address/hash160 are you looking for <compress, uncompress, both> Only for rmd160 and address\n");
+        printf("-c crypto   Search for specific crypto. <btc, eth> valid only w/ -m address\n");
+        printf("-C mini     Set the minikey Base only 22 character minikeys, ex: SRPqx8QiwnW4WNWnTVa2W5\n");
+        printf("-8 alpha    Set the bas58 alphabet for minikeys\n");
+        printf("-e          Enable endomorphism search (Only for address, rmd160 and vanity)\n");
+        printf("-f file     Specify file name with addresses or xpoints or uncompressed public keys\n");
+        printf("-G gb       Target gigabytes for the main BSGS bloom (adjusts false-positive rate)\n");
+        printf("-I stride   Stride for xpoint, rmd160 and address, this option don't work with bsgs\n");
+        printf("-k value    Use this only with bsgs mode, k value is factor for M, more speed but more RAM use wisely\n");
+        printf("-l look     What type of address/hash160 are you looking for <compress, uncompress, both> Only for rmd160 and address\n");
 	printf("-m mode     mode of search for cryptos. (bsgs, xpoint, rmd160, address, vanity) default: address\n");
 	printf("-M          Matrix screen, feel like a h4x0r, but performance will dropped\n");
 	printf("-n number   Check for N sequential numbers before the random chosen, this only works with -R option\n");
