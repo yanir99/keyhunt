@@ -1293,20 +1293,21 @@ rseed(generate_seed());
                 if(bsgs_bloom_target_gb > 0.0L) {
                         long double base_main_bytes = estimate_bloom_bytes(itemsbloom, BLOOM_ERROR_MAIN) * 256.0L;
                         long double target_bytes = bsgs_bloom_target_gb * BLOOM_GIGABYTE;
-                        if(target_bytes < base_main_bytes) {
-                                long double target_per_bloom = target_bytes / 256.0L;
-                                long double bits_per_entry_budget = (target_per_bloom * 8.0L) / static_cast<long double>(itemsbloom);
+                        long double target_per_bloom = target_bytes / 256.0L;
+                        long double bits_per_entry_budget = (target_per_bloom * 8.0L) / static_cast<long double>(itemsbloom);
+
+                        if(bits_per_entry_budget > 0.0L) {
                                 long double tuned_error = expl(-bits_per_entry_budget * BLOOM_LN2_SQUARED);
                                 if(tuned_error > 0.0L && tuned_error < 1.0L) {
                                         bloom_error_main_active = tuned_error;
                                         printf("[+] Tuning main bloom error to %.12Lf for ~%.2Lf GB (default %.2Lf GB)\n", bloom_error_main_active, target_bytes / BLOOM_GIGABYTE, base_main_bytes / BLOOM_GIGABYTE);
                                 }
                                 else {
-                                        fprintf(stderr,"[W] Requested bloom budget is too small; keeping default error rate.\n");
+                                        fprintf(stderr,"[W] Requested bloom budget could not produce a valid error rate; keeping default.\n");
                                 }
                         }
                         else {
-                                printf("[+] Requested bloom budget (%.2Lf GB) exceeds default use (%.2Lf GB); keeping default error.\n", target_bytes / BLOOM_GIGABYTE, base_main_bytes / BLOOM_GIGABYTE);
+                                fprintf(stderr,"[W] Requested bloom budget is too small; keeping default error rate.\n");
                         }
                 }
 
