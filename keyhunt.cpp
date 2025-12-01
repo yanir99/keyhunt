@@ -17,6 +17,7 @@ email: albertobsd@gmail.com
 #include <inttypes.h>
 #include <thread>
 #include <algorithm>
+#include <limits>
 #include "base58/libbase58.h"
 #include "rmd160/rmd160.h"
 #include "oldbloom/oldbloom.h"
@@ -1258,6 +1259,42 @@ rseed(generate_seed());
                         const uint64_t shard_multiple = 1024ULL;
                         if(tuned_k % shard_multiple != 0ULL) {
                                 tuned_k = ((tuned_k + shard_multiple - 1ULL) / shard_multiple) * shard_multiple;
+                        }
+
+                        auto estimate_main_bytes_for_k = [&](uint64_t kfactor) -> long double {
+                                if(kfactor == 0 || bsgs_m_root == 0) {
+                                        return 0.0L;
+                                }
+
+                                uint64_t capped_k = kfactor;
+                                if(kfactor > (std::numeric_limits<uint64_t>::max() / bsgs_m_root)) {
+                                        capped_k = std::numeric_limits<uint64_t>::max() / bsgs_m_root;
+                                }
+
+                                uint64_t prospective_m = bsgs_m_root * capped_k;
+                                uint64_t prospective_entries = compute_shard_entries(prospective_m, 1000);
+                                return estimate_bloom_bytes(prospective_entries, bloom_error_main_active) * 256.0L;
+                        };
+
+                        long double tuned_bytes = estimate_main_bytes_for_k(tuned_k);
+                        if(tuned_bytes < target_bytes) {
+                                uint64_t grown_k = tuned_k;
+                                while(tuned_bytes < target_bytes) {
+                                        if(grown_k > (std::numeric_limits<uint64_t>::max() - shard_multiple)) {
+                                                break;
+                                        }
+
+                                        uint64_t next_k = grown_k + shard_multiple;
+                                        long double next_bytes = estimate_main_bytes_for_k(next_k);
+                                        if(next_bytes <= tuned_bytes) {
+                                                break;
+                                        }
+
+                                        tuned_bytes = next_bytes;
+                                        grown_k = next_k;
+                                }
+
+                                tuned_k = grown_k;
                         }
 
                         if(!FLAG_USER_K) {
