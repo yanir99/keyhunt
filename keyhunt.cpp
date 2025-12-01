@@ -1232,24 +1232,33 @@ rseed(generate_seed());
 			exit(EXIT_FAILURE);
 		}
 
-		uint64_t bsgs_m_root = BSGS_M.GetInt64();
+                uint64_t bsgs_m_root = BSGS_M.GetInt64();
 
-		if(bsgs_bloom_target_gb > 0.0L) {
-			long double target_bytes = bsgs_bloom_target_gb * BLOOM_GIGABYTE;
-			long double target_per_bloom = target_bytes / 256.0L;
-			long double min_bpe_for_underflow = bloom_min_bpe_limit();
+                if(bsgs_bloom_target_gb > 0.0L) {
+                        long double target_bytes = bsgs_bloom_target_gb * BLOOM_GIGABYTE;
+                        long double target_per_bloom = target_bytes / 256.0L;
+                        long double bpe_default = -logl(bloom_error_main_active) / BLOOM_LN2_SQUARED;
+                        if(bpe_default <= 0.0L) {
+                                bpe_default = bloom_min_bpe_limit();
+                        }
 
-			long double desired_entries_ld = ceill((target_per_bloom * 8.0L) / min_bpe_for_underflow);
-			if(desired_entries_ld < 1000.0L) {
-				desired_entries_ld = 1000.0L;
-			}
+                        long double desired_entries_ld = ceill((target_per_bloom * 8.0L) / bpe_default);
+                        if(desired_entries_ld < 1000.0L) {
+                                desired_entries_ld = 1000.0L;
+                        }
 
-			uint64_t desired_entries = (uint64_t)desired_entries_ld;
-			uint64_t desired_m = desired_entries * 256ULL;
-			uint64_t tuned_k = (desired_m + bsgs_m_root - 1ULL) / bsgs_m_root;
-			if(tuned_k == 0) {
-				tuned_k = 1;
-			}
+                        uint64_t desired_entries = (uint64_t)desired_entries_ld;
+                        uint64_t desired_m = desired_entries * 256ULL;
+                        uint64_t tuned_k = (desired_m + bsgs_m_root - 1ULL) / bsgs_m_root;
+                        if(tuned_k == 0) {
+                                tuned_k = 1;
+                        }
+
+                        // Keep M divisible by the bloom shard count to avoid setup failures later.
+                        const uint64_t shard_multiple = 1024ULL;
+                        if(tuned_k % shard_multiple != 0ULL) {
+                                tuned_k = ((tuned_k + shard_multiple - 1ULL) / shard_multiple) * shard_multiple;
+                        }
 
                         if(!FLAG_USER_K) {
                                 KFACTOR = (int)tuned_k;
@@ -1258,15 +1267,7 @@ rseed(generate_seed());
                         else if(tuned_k > (uint64_t)KFACTOR) {
                                 printf("[W] Provided K factor %i is below the value %" PRIu64 " suggested for the bloom budget\n", KFACTOR, tuned_k);
                         }
-
-			if(!FLAG_USER_N) {
-				BSGS_N.SetInt64(bsgs_m_root);
-				BSGS_N.Mult((uint64_t)bsgs_m_root);
-				BSGS_N.Mult((uint64_t)tuned_k);
-				BSGS_N.Mult((uint64_t)tuned_k);
-				printf("[+] Auto-adjusted N to match bloom target sizing\n");
-			}
-		}
+                }
 
 
 		BSGS_AUX.Set(&BSGS_M);
