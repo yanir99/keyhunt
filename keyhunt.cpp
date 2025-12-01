@@ -296,6 +296,7 @@ bool FLAG_USER_K = false;
 bool FLAG_USER_N = false;
 int MAXLENGTHADDRESS = -1;
 int NTHREADS = 1;
+bool FLAGTHREADSUSER = false;
 
 int FLAGSAVEREADFILE = 0;
 int FLAGREADEDFILE1 = 0;
@@ -336,9 +337,16 @@ const long double BLOOM_GIGABYTE = 1073741824.0L;
 
 long double bloom_error_main_active = BLOOM_ERROR_MAIN;
 long double bsgs_bloom_target_gb = 0.0L;
+static inline unsigned int bsgs_auto_threads() {
+	unsigned int workers = std::thread::hardware_concurrency();
+	if(workers == 0) {
+		workers = 2;
+	}
+	return workers;
+}
 
 static inline long double bloom_min_bpe_limit() {
-        return -logl(LDBL_MIN) / BLOOM_LN2_SQUARED;
+	return -logl(LDBL_MIN) / BLOOM_LN2_SQUARED;
 }
 
 static unsigned long generate_seed() {
@@ -441,6 +449,41 @@ static bool verify_bloom_checksums_parallel(struct bloom *blooms, struct checksu
                 fprintf(stderr,"[E] Error checksum file mismatch! %s\n",label);
         }
         return ok.load();
+}
+
+void compute_bloom_checksums_parallel(struct bloom *blooms, struct checksumsha256 *checksums, size_t count) {
+	unsigned int workers = std::thread::hardware_concurrency();
+	if(workers == 0) {
+		workers = 4;
+	}
+
+	size_t chunk = (count + workers - 1) / workers;
+	std::vector<std::thread> threads;
+	threads.reserve(workers);
+
+	auto hash_chunk = [&](size_t start, size_t end) {
+		uint8_t rawvalue[32];
+		for(size_t i = start; i < end; ++i) {
+			sha256((uint8_t*)blooms[i].bf, blooms[i].bytes,(uint8_t*) rawvalue);
+			memcpy(checksums[i].data, rawvalue, 32);
+			memcpy(checksums[i].backup, rawvalue, 32);
+		}
+	};
+
+	for(unsigned int t = 0; t < workers; ++t) {
+		size_t start = t * chunk;
+		if(start >= count) {
+			break;
+		}
+		size_t end = std::min(count, start + chunk);
+		threads.emplace_back(hash_chunk, start, end);
+	}
+
+	for(auto &th : threads) {
+		if(th.joinable()) {
+			th.join();
+		}
+	}
 }
 
 /*
@@ -842,6 +885,7 @@ rseed(generate_seed());
 			break;
 			case 't':
 				NTHREADS = strtol(optarg,NULL,10);
+				FLAGTHREADSUSER = true;
 				if(NTHREADS <= 0)	{
 					NTHREADS = 1;
 				}
@@ -1762,6 +1806,13 @@ rseed(generate_seed());
 		}
 		
 		if(!FLAGREADEDFILE1 || !FLAGREADEDFILE2 || !FLAGREADEDFILE3 || !FLAGREADEDFILE4)	{
+			if(!FLAGTHREADSUSER) {
+				unsigned int auto_threads = bsgs_auto_threads();
+				if(NTHREADS < (int)auto_threads) {
+					NTHREADS = auto_threads;
+					printf("[+] Auto-scaling BSGS bloom build threads to %u\n", NTHREADS);
+				}
+			}
 			if(FLAGREADEDFILE1 == 1)	{
 				/* 
 					We need just to make File 2 to File 4 this is
@@ -1994,24 +2045,15 @@ rseed(generate_seed());
 			fflush(stdout);
 		}	
 		if(!FLAGREADEDFILE1)	{
-			for(i = 0; i < 256 ; i++)	{
-				sha256((uint8_t*)bloom_bP[i].bf, bloom_bP[i].bytes,(uint8_t*) bloom_bP_checksums[i].data);
-				memcpy(bloom_bP_checksums[i].backup,bloom_bP_checksums[i].data,32);
-			}
+			compute_bloom_checksums_parallel(bloom_bP, bloom_bP_checksums, 256);
 			printf(".");
 		}
 		if(!FLAGREADEDFILE2)	{
-			for(i = 0; i < 256 ; i++)	{
-				sha256((uint8_t*)bloom_bPx2nd[i].bf, bloom_bPx2nd[i].bytes,(uint8_t*) bloom_bPx2nd_checksums[i].data);
-				memcpy(bloom_bPx2nd_checksums[i].backup,bloom_bPx2nd_checksums[i].data,32);
-			}
+			compute_bloom_checksums_parallel(bloom_bPx2nd, bloom_bPx2nd_checksums, 256);
 			printf(".");
 		}
 		if(!FLAGREADEDFILE4)	{
-			for(i = 0; i < 256 ; i++)	{
-				sha256((uint8_t*)bloom_bPx3rd[i].bf, bloom_bPx3rd[i].bytes,(uint8_t*) bloom_bPx3rd_checksums[i].data);
-				memcpy(bloom_bPx3rd_checksums[i].backup,bloom_bPx3rd_checksums[i].data,32);
-			}
+			compute_bloom_checksums_parallel(bloom_bPx3rd, bloom_bPx3rd_checksums, 256);
 			printf(".");
 		}
 		if(!FLAGREADEDFILE1 || !FLAGREADEDFILE2 || !FLAGREADEDFILE4)	{
