@@ -551,6 +551,7 @@ Int BSGS_M2;				//M2 is M/32
 Int BSGS_M2_double;			//M2_double is M2 * 2
 Int BSGS_M3;				//M3 is M2/32
 Int BSGS_M3_double;			//M3_double is M3 * 2
+Int bsgs_key_offset;			//Precomputed offset used for BSGS start point shift
 
 Int ONE;
 Int ZERO;
@@ -564,6 +565,7 @@ Point BSGS_MP3;			//MP3 values this is m3 * P
 Point BSGS_MP_double;			//MP2 values this is m2 * P * 2
 Point BSGS_MP2_double;			//MP2 values this is m2 * P * 2
 Point BSGS_MP3_double;			//MP3 values this is m3 * P * 2
+Point bsgs_key_offset_point;		//Offset point for avoiding extra scalar mult in BSGS giant steps
 
 
 std::vector<Point> BSGS_AMP2;
@@ -935,10 +937,6 @@ rseed(generate_seed());
 		}
 	}
 	
-	if(  FLAGBSGSMODE == MODE_BSGS && FLAGENDOMORPHISM)	{
-		fprintf(stderr,"[E] Endomorphism doesn't work with BSGS\n");
-		exit(EXIT_FAILURE);
-	}
 	
 	
 	if(  FLAGBSGSMODE == MODE_BSGS  && FLAGSTRIDE)	{
@@ -1553,6 +1551,14 @@ rseed(generate_seed());
 		BSGS_MP2_double = secp->ComputePublicKey(&BSGS_M2_double);
 		BSGS_MP3 = secp->ComputePublicKey(&BSGS_M3);
 		BSGS_MP3_double = secp->ComputePublicKey(&BSGS_M3_double);
+
+		/* Precompute the group-distance (intaux) used by all giant steps so we can
+		 * derive the auxiliary point with an addition instead of an extra scalar multiplication
+		 * inside every BSGS loop. */
+		bsgs_key_offset.Set(&BSGS_M_double);
+		bsgs_key_offset.Mult(CPU_GRP_SIZE / 2);
+		bsgs_key_offset.Add(&BSGS_M);
+		bsgs_key_offset_point = secp->ComputePublicKey(&bsgs_key_offset);
 		
 		BSGS_AMP2.reserve(32);
 		BSGS_AMP3.reserve(32);
@@ -2752,10 +2758,12 @@ void *thread_process(void *vargp)	{
 	Int dx[CPU_GRP_SIZE / 2 + 1];
 	IntGroup *grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
 	Point startP;
-	Int dy;
-	Int dyn;
-	Int _s;
-	Int _p;
+Int dy;
+Int dyn;
+Int _s;
+Int _p;
+Int x_beta;
+Int x_beta2;
 	Point pp;
 	Point pn;
 	int i,l,pp_offset,pn_offset,hLength = (CPU_GRP_SIZE / 2 - 1);
@@ -4014,14 +4022,14 @@ void *thread_process_bsgs(void *vargp)	{
 	FILE* filekey;
 	struct tothread* tt;
 
-	// Character variables
-	char xpoint_raw[32], *aux_c, *hextemp;
+// Character variables
+char xpoint_raw[32], xpoint_beta[32], xpoint_beta2[32], *aux_c, *hextemp;
 
 	// Integer variables
 	Int base_key, keyfound;
-	IntGroup* grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
-	Int dx[CPU_GRP_SIZE / 2 + 1];
-	Int dy, dyn, _s, _p, km, intaux;
+IntGroup* grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
+Int dx[CPU_GRP_SIZE / 2 + 1];
+Int dy, dyn, _s, _p, x_beta, x_beta2;
 
 	// Point variables
 	Point base_point, point_aux, point_found;
@@ -4044,11 +4052,6 @@ void *thread_process_bsgs(void *vargp)	{
 	if(bsgs_aux % 1024 != 0)	{
 		cycles++;
 	}
-
-	intaux.Set(&BSGS_M_double);
-	intaux.Mult(CPU_GRP_SIZE/2);
-	intaux.Add(&BSGS_M);
-	
 	do	{	
 	/*
 		We do this in an atomic pthread_mutex operation to not affect others threads
@@ -4092,11 +4095,8 @@ void *thread_process_bsgs(void *vargp)	{
 			}
 		}
 		base_point = secp->ComputePublicKey(&base_key);
-		km.Set(&base_key);
-		km.Neg();
-		km.Add(&secp->order);
-		km.Sub(&intaux);
-		point_aux = secp->ComputePublicKey(&km);
+		point_aux = secp->AddDirect(base_point,bsgs_key_offset_point);
+		point_aux = secp->Negation(point_aux);
 		for(k = 0; k < bsgs_point_number ; k++)	{
 			if(bsgs_found[k] == 0)	{
 				startP  = secp->AddDirect(OriginalPointsBSGS[k],point_aux);
@@ -4177,6 +4177,16 @@ pn.y.ModAdd(&GSn[i].y);
 					for(int i = 0; i<CPU_GRP_SIZE && bsgs_found[k]== 0; i++) {
 						pts[i].x.Get32Bytes((unsigned char*)xpoint_raw);
 						r = bloom_check(&bloom_bP[((unsigned char)xpoint_raw[0])],xpoint_raw,32);
+						if(!r && FLAGENDOMORPHISM){
+							x_beta.ModMulK1(&pts[i].x,&beta);
+							x_beta2.ModMulK1(&pts[i].x,&beta2);
+							x_beta.Get32Bytes((unsigned char*)xpoint_beta);
+							x_beta2.Get32Bytes((unsigned char*)xpoint_beta2);
+							r = bloom_check(&bloom_bP[((unsigned char)xpoint_beta[0])],xpoint_beta,32);
+							if(!r){
+								r = bloom_check(&bloom_bP[((unsigned char)xpoint_beta2[0])],xpoint_beta2,32);
+							}
+						}
 						if(r) {
 							r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
 							if(r)	{
@@ -4249,7 +4259,7 @@ void *thread_process_bsgs_random(void *vargp)	{
 
 	FILE *filekey;
 	struct tothread *tt;
-	char xpoint_raw[32],*aux_c,*hextemp;
+char xpoint_raw[32], xpoint_beta[32], xpoint_beta2[32],*aux_c,*hextemp;
 	Int base_key,keyfound,n_range_random;
 	Point base_point,point_aux,point_found;
 	uint32_t l,k,r,salir,thread_number,cycles;
@@ -4266,7 +4276,8 @@ void *thread_process_bsgs_random(void *vargp)	{
 	Int dyn;
 	Int _s;
 	Int _p;
-	Int km,intaux;
+	Int x_beta;
+	Int x_beta2;
 	Point pp;
 	Point pn;
 	grp->Set(dx);
@@ -4281,10 +4292,6 @@ void *thread_process_bsgs_random(void *vargp)	{
 		cycles++;
 	}
 	
-	intaux.Set(&BSGS_M_double);
-	intaux.Mult(CPU_GRP_SIZE/2);
-	intaux.Add(&BSGS_M);
-
 	do	{
 		
 	
@@ -4306,13 +4313,13 @@ void *thread_process_bsgs_random(void *vargp)	{
 		pthread_mutex_unlock(&bsgs_thread);
 #endif
 
-		if(FLAGMATRIX)	{
+		if(FLAGMATRIX)  {
 				aux_c = base_key.GetBase16();
 				printf("[+] Thread 0x%s  \n",aux_c);
 				fflush(stdout);
 				free(aux_c);
 		}
-		else{
+				else{
 			if(FLAGQUIET == 0){
 				aux_c = base_key.GetBase16();
 				printf("\r[+] Thread 0x%s  \r",aux_c);
@@ -4323,13 +4330,8 @@ void *thread_process_bsgs_random(void *vargp)	{
 		}
 		base_point = secp->ComputePublicKey(&base_key);
 
-		km.Set(&base_key);
-		km.Neg();
-		
-		
-		km.Add(&secp->order);
-		km.Sub(&intaux);
-		point_aux = secp->ComputePublicKey(&km);
+		point_aux = secp->AddDirect(base_point,bsgs_key_offset_point);
+		point_aux = secp->Negation(point_aux);
 
 
 		/* We need to test individually every point in BSGS_Q */
@@ -4426,6 +4428,16 @@ pn.y.ModAdd(&GSn[i].y);
 					for(int i = 0; i<CPU_GRP_SIZE && bsgs_found[k]== 0; i++) {
 						pts[i].x.Get32Bytes((unsigned char*)xpoint_raw);
 						r = bloom_check(&bloom_bP[((unsigned char)xpoint_raw[0])],xpoint_raw,32);
+						if(!r && FLAGENDOMORPHISM){
+							x_beta.ModMulK1(&pts[i].x,&beta);
+							x_beta2.ModMulK1(&pts[i].x,&beta2);
+							x_beta.Get32Bytes((unsigned char*)xpoint_beta);
+							x_beta2.Get32Bytes((unsigned char*)xpoint_beta2);
+							r = bloom_check(&bloom_bP[((unsigned char)xpoint_beta[0])],xpoint_beta,32);
+							if(!r){
+								r = bloom_check(&bloom_bP[((unsigned char)xpoint_beta2[0])],xpoint_beta2,32);
+							}
+						}
 						if(r) {
 							r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
 							if(r)	{
@@ -4992,8 +5004,8 @@ void *thread_process_bsgs_dance(void *vargp)	{
 	Point pp,pn,startP,base_point,point_aux,point_found;
 	FILE *filekey;
 	struct tothread *tt;
-	char xpoint_raw[32],*aux_c,*hextemp;
-	Int base_key,keyfound,dy,dyn,_s,_p,km,intaux;
+	char xpoint_raw[32], xpoint_beta[32], xpoint_beta2[32],*aux_c,*hextemp;
+Int base_key,keyfound,dy,dyn,_s,_p,x_beta,x_beta2;
 	IntGroup *grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
 	uint32_t k,l,r,salir,thread_number,entrar,cycles;
 	int hLength = (CPU_GRP_SIZE / 2 - 1);	
@@ -5008,14 +5020,9 @@ void *thread_process_bsgs_dance(void *vargp)	{
 	if(bsgs_aux % 1024 != 0)	{
 		cycles++;
 	}
-	
-	intaux.Set(&BSGS_M_double);
-	intaux.Mult(CPU_GRP_SIZE/2);
-	intaux.Add(&BSGS_M);
-	
+
 	entrar = 1;
-	
-	
+
 	/*
 		while base_key is less than n_range_end then:
 	*/
@@ -5088,14 +5095,10 @@ void *thread_process_bsgs_dance(void *vargp)	{
 			}
 		}
 		
-		base_point = secp->ComputePublicKey(&base_key);
+base_point = secp->ComputePublicKey(&base_key);
 
-		km.Set(&base_key);
-		km.Neg();
-		
-		km.Add(&secp->order);
-		km.Sub(&intaux);
-		point_aux = secp->ComputePublicKey(&km);
+point_aux = secp->AddDirect(base_point,bsgs_key_offset_point);
+point_aux = secp->Negation(point_aux);
 		
 		for(k = 0; k < bsgs_point_number ; k++)	{
 			if(bsgs_found[k] == 0)	{
@@ -5191,6 +5194,16 @@ pn.y.ModAdd(&GSn[i].y);
 					for(int i = 0; i<CPU_GRP_SIZE && bsgs_found[k]== 0; i++) {
 						pts[i].x.Get32Bytes((unsigned char*)xpoint_raw);
 						r = bloom_check(&bloom_bP[((unsigned char)xpoint_raw[0])],xpoint_raw,32);
+						if(!r && FLAGENDOMORPHISM){
+							x_beta.ModMulK1(&pts[i].x,&beta);
+							x_beta2.ModMulK1(&pts[i].x,&beta2);
+							x_beta.Get32Bytes((unsigned char*)xpoint_beta);
+							x_beta2.Get32Bytes((unsigned char*)xpoint_beta2);
+							r = bloom_check(&bloom_bP[((unsigned char)xpoint_beta[0])],xpoint_beta,32);
+							if(!r){
+								r = bloom_check(&bloom_bP[((unsigned char)xpoint_beta2[0])],xpoint_beta2,32);
+							}
+						}
 						if(r) {
 							r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
 							if(r)	{
@@ -5266,8 +5279,8 @@ void *thread_process_bsgs_backward(void *vargp)	{
 #endif
 	FILE *filekey;
 	struct tothread *tt;
-	char xpoint_raw[32],*aux_c,*hextemp;
-	Int base_key,keyfound;
+	char xpoint_raw[32], xpoint_beta[32], xpoint_beta2[32],*aux_c,*hextemp;
+Int base_key,keyfound,x_beta,x_beta2;
 	Point base_point,point_aux,point_found;
 	uint32_t k,l,r,salir,thread_number,entrar,cycles;
 	
@@ -5283,7 +5296,6 @@ void *thread_process_bsgs_backward(void *vargp)	{
 	Int dyn;
 	Int _s;
 	Int _p;
-	Int km,intaux;
 	Point pp;
 	Point pn;
 	grp->Set(dx);
@@ -5296,11 +5308,7 @@ void *thread_process_bsgs_backward(void *vargp)	{
 	if(bsgs_aux % 1024 != 0)	{
 		cycles++;
 	}
-	
-	intaux.Set(&BSGS_M_double);
-	intaux.Mult(CPU_GRP_SIZE/2);
-	intaux.Add(&BSGS_M);
-	
+
 	entrar = 1;
 	/*
 		while base_key is less than n_range_end then:
@@ -5347,15 +5355,11 @@ void *thread_process_bsgs_backward(void *vargp)	{
 				THREADOUTPUT = 1;
 			}
 		}
-		
+
 		base_point = secp->ComputePublicKey(&base_key);
 
-		km.Set(&base_key);
-		km.Neg();
-		
-		km.Add(&secp->order);
-		km.Sub(&intaux);
-		point_aux = secp->ComputePublicKey(&km);
+		point_aux = secp->AddDirect(base_point,bsgs_key_offset_point);
+		point_aux = secp->Negation(point_aux);
 		
 		for(k = 0; k < bsgs_point_number ; k++)	{
 			if(bsgs_found[k] == 0)	{
@@ -5449,6 +5453,16 @@ pn.y.ModAdd(&GSn[i].y);
 					for(int i = 0; i<CPU_GRP_SIZE && bsgs_found[k]== 0; i++) {
 						pts[i].x.Get32Bytes((unsigned char*)xpoint_raw);
 						r = bloom_check(&bloom_bP[((unsigned char)xpoint_raw[0])],xpoint_raw,32);
+						if(!r && FLAGENDOMORPHISM){
+							x_beta.ModMulK1(&pts[i].x,&beta);
+							x_beta2.ModMulK1(&pts[i].x,&beta2);
+							x_beta.Get32Bytes((unsigned char*)xpoint_beta);
+							x_beta2.Get32Bytes((unsigned char*)xpoint_beta2);
+							r = bloom_check(&bloom_bP[((unsigned char)xpoint_beta[0])],xpoint_beta,32);
+							if(!r){
+								r = bloom_check(&bloom_bP[((unsigned char)xpoint_beta2[0])],xpoint_beta2,32);
+							}
+						}
 						if(r) {
 							r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
 							if(r)	{
@@ -5523,8 +5537,8 @@ void *thread_process_bsgs_both(void *vargp)	{
 #endif
 	FILE *filekey;
 	struct tothread *tt;
-	char xpoint_raw[32],*aux_c,*hextemp;
-	Int base_key,keyfound;
+	char xpoint_raw[32], xpoint_beta[32], xpoint_beta2[32],*aux_c,*hextemp;
+Int base_key,keyfound,x_beta,x_beta2;
 	Point base_point,point_aux,point_found;
 	uint32_t k,l,r,salir,thread_number,entrar,cycles;
 	
@@ -5540,27 +5554,20 @@ void *thread_process_bsgs_both(void *vargp)	{
 	Int dyn;
 	Int _s;
 	Int _p;
-	Int km,intaux;
 	Point pp;
 	Point pn;
 	grp->Set(dx);
 
-	
 	tt = (struct tothread *)vargp;
 	thread_number = tt->nt;
 	free(tt);
-	
+
 	cycles = bsgs_aux / 1024;
 	if(bsgs_aux % 1024 != 0)	{
 		cycles++;
 	}
-	intaux.Set(&BSGS_M_double);
-	intaux.Mult(CPU_GRP_SIZE/2);
-	intaux.Add(&BSGS_M);
-	
 	entrar = 1;
-	
-	
+
 	/*
 		while BSGS_CURRENT is less than n_range_end 
 	*/
@@ -5632,14 +5639,10 @@ void *thread_process_bsgs_both(void *vargp)	{
 			}
 		}
 		
-		base_point = secp->ComputePublicKey(&base_key);
+base_point = secp->ComputePublicKey(&base_key);
 
-		km.Set(&base_key);
-		km.Neg();
-		
-		km.Add(&secp->order);
-		km.Sub(&intaux);
-		point_aux = secp->ComputePublicKey(&km);
+point_aux = secp->AddDirect(base_point,bsgs_key_offset_point);
+point_aux = secp->Negation(point_aux);
 		
 		for(k = 0; k < bsgs_point_number ; k++)	{
 			if(bsgs_found[k] == 0)	{
@@ -5731,9 +5734,19 @@ void *thread_process_bsgs_both(void *vargp)	{
 						pts[0] = pn;
 						
 						for(int i = 0; i<CPU_GRP_SIZE && bsgs_found[k]== 0; i++) {
-							pts[i].x.Get32Bytes((unsigned char*)xpoint_raw);
-							r = bloom_check(&bloom_bP[((unsigned char)xpoint_raw[0])],xpoint_raw,32);
-							if(r) {
+                                                pts[i].x.Get32Bytes((unsigned char*)xpoint_raw);
+                                                r = bloom_check(&bloom_bP[((unsigned char)xpoint_raw[0])],xpoint_raw,32);
+                                                if(!r && FLAGENDOMORPHISM){
+                                                        x_beta.ModMulK1(&pts[i].x,&beta);
+                                                        x_beta2.ModMulK1(&pts[i].x,&beta2);
+                                                        x_beta.Get32Bytes((unsigned char*)xpoint_beta);
+                                                        x_beta2.Get32Bytes((unsigned char*)xpoint_beta2);
+                                                        r = bloom_check(&bloom_bP[((unsigned char)xpoint_beta[0])],xpoint_beta,32);
+                                                        if(!r){
+                                                                r = bloom_check(&bloom_bP[((unsigned char)xpoint_beta2[0])],xpoint_beta2,32);
+                                                        }
+                                                }
+                                                if(r) {
 								r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
 								if(r)	{
 									hextemp = keyfound.GetBase16();
