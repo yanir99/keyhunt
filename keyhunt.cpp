@@ -1840,11 +1840,6 @@ rseed(generate_seed());
 			else	{
 				FLAGREADEDFILE4 = 0;
 			}
-
-			}
-			else	{
-				FLAGREADEDFILE4 = 0;
-			}
 			
 		}
 		
