@@ -226,7 +226,7 @@ static uint64_t compute_shard_entries(uint64_t total_elements, uint64_t minimum)
         return (shard < minimum) ? minimum : shard;
 }
 
-const long double BLOOM_ERROR_MAIN = 0.00000001L; // 1e-8
+const long double BLOOM_ERROR_MAIN = 0.000001L; // 1e-6
 const long double BLOOM_ERROR_SECOND = 0.000005L; // 5e-6
 const long double BLOOM_ERROR_THIRD = 0.000025L; // 2.5e-5
 
