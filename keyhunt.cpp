@@ -5952,9 +5952,9 @@ void menu() {
         printf("-c crypto   Search for specific crypto. <btc, eth> valid only w/ -m address\n");
         printf("-C mini     Set the minikey Base only 22 character minikeys, ex: SRPqx8QiwnW4WNWnTVa2W5\n");
         printf("-8 alpha    Set the bas58 alphabet for minikeys\n");
-        printf("-e          Enable endomorphism search (Only for address, rmd160 and vanity)\n");
+        printf("-e          Enable endomorphism search (address, rmd160, vanity, xpoint and bsgs)\n");
         printf("-f file     Specify file name with addresses or xpoints or uncompressed public keys\n");
-printf("-G gb       Target gigabytes for the main BSGS bloom (auto-tunes k/n and false-positive rate)\n");
+        printf("-G gb       Target gigabytes for the main BSGS bloom (auto-tunes k/n and false-positive rate)\n");
         printf("-I stride   Stride for xpoint, rmd160 and address, this option don't work with bsgs\n");
         printf("-k value    Use this only with bsgs mode, k value is factor for M, more speed but more RAM use wisely\n");
         printf("-l look     What type of address/hash160 are you looking for <compress, uncompress, both> Only for rmd160 and address\n");
