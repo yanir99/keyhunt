@@ -8,6 +8,7 @@ email: albertobsd@gmail.com
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include <time.h>
 #include <vector>
 #include <array>
@@ -16,6 +17,7 @@ email: albertobsd@gmail.com
 #include <inttypes.h>
 #include <thread>
 #include <algorithm>
+#include <limits>
 #include "base58/libbase58.h"
 #include "rmd160/rmd160.h"
 #include "oldbloom/oldbloom.h"
@@ -291,8 +293,11 @@ int FLAGDEBUG = 0;
 int FLAGQUIET = 0;
 int FLAGMATRIX = 0;
 int KFACTOR = 1;
+bool FLAG_USER_K = false;
+bool FLAG_USER_N = false;
 int MAXLENGTHADDRESS = -1;
 int NTHREADS = 1;
+bool FLAGTHREADSUSER = false;
 
 int FLAGSAVEREADFILE = 0;
 int FLAGREADEDFILE1 = 0;
@@ -324,6 +329,26 @@ Int stride;
 const uint64_t BSGS_XVALUE_RAM = 6;
 const uint64_t BSGS_BUFFERXPOINTLENGTH = 32;
 const uint64_t BSGS_BUFFERREGISTERLENGTH = 36;
+
+const long double BLOOM_ERROR_MAIN = 0.000001L; // 1e-6
+const long double BLOOM_ERROR_SECOND = 0.000005L; // 5e-6
+const long double BLOOM_ERROR_THIRD = 0.000025L; // 2.5e-5
+const long double BLOOM_LN2_SQUARED = 0.480453013918201L;
+const long double BLOOM_GIGABYTE = 1073741824.0L;
+
+long double bloom_error_main_active = BLOOM_ERROR_MAIN;
+long double bsgs_bloom_target_gb = 0.0L;
+static inline unsigned int bsgs_auto_threads() {
+	unsigned int workers = std::thread::hardware_concurrency();
+	if(workers == 0) {
+		workers = 2;
+	}
+	return workers;
+}
+
+static inline long double bloom_min_bpe_limit() {
+	return -logl(LDBL_MIN) / BLOOM_LN2_SQUARED;
+}
 
 static unsigned long generate_seed() {
 #if defined(_WIN64) && !defined(__CYGWIN__)
@@ -358,6 +383,20 @@ static unsigned long generate_seed() {
 static uint64_t compute_shard_entries(uint64_t total_elements, uint64_t minimum) {
         uint64_t shard = (total_elements + 255ULL) / 256ULL;
         return (shard < minimum) ? minimum : shard;
+}
+
+static long double estimate_bloom_bytes(uint64_t entries, long double error_rate) {
+        if(entries == 0 || error_rate <= 0.0L || error_rate >= 1.0L) {
+                return 0.0L;
+        }
+
+        long double bpe = -logl(error_rate) / BLOOM_LN2_SQUARED;
+        long double bits = static_cast<long double>(entries) * bpe;
+        long double bytes = bits / 8.0L;
+        if(fmodl(bits, 8.0L) != 0.0L) {
+                bytes += 1.0L;
+        }
+        return bytes;
 }
 
 static void apply_large_file_buffer(FILE *fd) {
@@ -413,9 +452,40 @@ static bool verify_bloom_checksums_parallel(struct bloom *blooms, struct checksu
         return ok.load();
 }
 
-const long double BLOOM_ERROR_MAIN = 0.00000001L; // 1e-8
-const long double BLOOM_ERROR_SECOND = 0.000005L; // 5e-6
-const long double BLOOM_ERROR_THIRD = 0.000025L; // 2.5e-5
+void compute_bloom_checksums_parallel(struct bloom *blooms, struct checksumsha256 *checksums, size_t count) {
+	unsigned int workers = std::thread::hardware_concurrency();
+	if(workers == 0) {
+		workers = 4;
+	}
+
+	size_t chunk = (count + workers - 1) / workers;
+	std::vector<std::thread> threads;
+	threads.reserve(workers);
+
+	auto hash_chunk = [&](size_t start, size_t end) {
+		uint8_t rawvalue[32];
+		for(size_t i = start; i < end; ++i) {
+			sha256((uint8_t*)blooms[i].bf, blooms[i].bytes,(uint8_t*) rawvalue);
+			memcpy(checksums[i].data, rawvalue, 32);
+			memcpy(checksums[i].backup, rawvalue, 32);
+		}
+	};
+
+	for(unsigned int t = 0; t < workers; ++t) {
+		size_t start = t * chunk;
+		if(start >= count) {
+			break;
+		}
+		size_t end = std::min(count, start + chunk);
+		threads.emplace_back(hash_chunk, start, end);
+	}
+
+	for(auto &th : threads) {
+		if(th.joinable()) {
+			th.join();
+		}
+	}
+}
 
 /*
 BSGS Variables
@@ -659,16 +729,27 @@ rseed(generate_seed());
 				beta.SetBase16("7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee");
 				beta2.SetBase16("851695d49a83f8ef919bb86153cbcb16630fb68aed0a766a3ec693d68e6afa40");
 			break;
-			case 'f':
-				FLAGFILE = 1;
-				fileName = optarg;
-			break;
-			case 'I':
-				FLAGSTRIDE = 1;
-				str_stride = optarg;
-			break;
+                        case 'f':
+                                FLAGFILE = 1;
+                                fileName = optarg;
+                        break;
+                        case 'G':
+                                bsgs_bloom_target_gb = strtold(optarg, NULL);
+                                if(bsgs_bloom_target_gb > 0.0L) {
+                                        printf("[+] Targeting %.2Lf GB for main BSGS bloom\n", bsgs_bloom_target_gb);
+                                }
+                                else    {
+                                        fprintf(stderr,"[E] Invalid bloom budget: %s\n", optarg);
+                                        exit(EXIT_FAILURE);
+                                }
+                        break;
+                        case 'I':
+                                FLAGSTRIDE = 1;
+                                str_stride = optarg;
+                        break;
 			case 'k':
 				KFACTOR = (int)strtol(optarg,NULL,10);
+				FLAG_USER_K = 1;
 				if(KFACTOR <= 0)	{
 					KFACTOR = 1;
 				}
@@ -739,6 +820,7 @@ rseed(generate_seed());
 			break;
 			case 'n':
 				FLAG_N = 1;
+				FLAG_USER_N = 1;
 				str_N = optarg;
 			break;
 			case 'q':
@@ -804,6 +886,7 @@ rseed(generate_seed());
 			break;
 			case 't':
 				NTHREADS = strtol(optarg,NULL,10);
+				FLAGTHREADSUSER = true;
 				if(NTHREADS <= 0)	{
 					NTHREADS = 1;
 				}
@@ -1150,6 +1233,80 @@ rseed(generate_seed());
 			exit(EXIT_FAILURE);
 		}
 
+                uint64_t bsgs_m_root = BSGS_M.GetInt64();
+
+                if(bsgs_bloom_target_gb > 0.0L) {
+                        long double target_bytes = bsgs_bloom_target_gb * BLOOM_GIGABYTE;
+                        long double target_per_bloom = target_bytes / 256.0L;
+                        long double bpe_default = -logl(bloom_error_main_active) / BLOOM_LN2_SQUARED;
+                        if(bpe_default <= 0.0L) {
+                                bpe_default = bloom_min_bpe_limit();
+                        }
+
+                        long double desired_entries_ld = ceill((target_per_bloom * 8.0L) / bpe_default);
+                        if(desired_entries_ld < 1000.0L) {
+                                desired_entries_ld = 1000.0L;
+                        }
+
+                        uint64_t desired_entries = (uint64_t)desired_entries_ld;
+                        uint64_t desired_m = desired_entries * 256ULL;
+                        uint64_t tuned_k = (desired_m + bsgs_m_root - 1ULL) / bsgs_m_root;
+                        if(tuned_k == 0) {
+                                tuned_k = 1;
+                        }
+
+                        // Keep M divisible by the bloom shard count to avoid setup failures later.
+                        const uint64_t shard_multiple = 1024ULL;
+                        if(tuned_k % shard_multiple != 0ULL) {
+                                tuned_k = ((tuned_k + shard_multiple - 1ULL) / shard_multiple) * shard_multiple;
+                        }
+
+                        auto estimate_main_bytes_for_k = [&](uint64_t kfactor) -> long double {
+                                if(kfactor == 0 || bsgs_m_root == 0) {
+                                        return 0.0L;
+                                }
+
+                                uint64_t capped_k = kfactor;
+                                if(kfactor > (std::numeric_limits<uint64_t>::max() / bsgs_m_root)) {
+                                        capped_k = std::numeric_limits<uint64_t>::max() / bsgs_m_root;
+                                }
+
+                                uint64_t prospective_m = bsgs_m_root * capped_k;
+                                uint64_t prospective_entries = compute_shard_entries(prospective_m, 1000);
+                                return estimate_bloom_bytes(prospective_entries, bloom_error_main_active) * 256.0L;
+                        };
+
+                        long double tuned_bytes = estimate_main_bytes_for_k(tuned_k);
+                        if(tuned_bytes < target_bytes) {
+                                uint64_t grown_k = tuned_k;
+                                while(tuned_bytes < target_bytes) {
+                                        if(grown_k > (std::numeric_limits<uint64_t>::max() - shard_multiple)) {
+                                                break;
+                                        }
+
+                                        uint64_t next_k = grown_k + shard_multiple;
+                                        long double next_bytes = estimate_main_bytes_for_k(next_k);
+                                        if(next_bytes <= tuned_bytes) {
+                                                break;
+                                        }
+
+                                        tuned_bytes = next_bytes;
+                                        grown_k = next_k;
+                                }
+
+                                tuned_k = grown_k;
+                        }
+
+                        if(!FLAG_USER_K) {
+                                KFACTOR = (int)tuned_k;
+                                printf("[+] Auto-adjusted K factor to %i for %.2Lf GB bloom target\n", KFACTOR, bsgs_bloom_target_gb);
+                        }
+                        else if(tuned_k > (uint64_t)KFACTOR) {
+                                printf("[W] Provided K factor %i is below the value %" PRIu64 " suggested for the bloom budget\n", KFACTOR, tuned_k);
+                        }
+                }
+
+
 		BSGS_AUX.Set(&BSGS_M);
 		BSGS_AUX.Mod(&BSGS_GROUP_SIZE);	
 		
@@ -1254,12 +1411,47 @@ rseed(generate_seed());
 		BSGS_N_double.Mult(&BSGS_N);
 
 		
-		hextemp = BSGS_N.GetBase16();
-		printf("[+] N = 0x%s\n",hextemp);
-		free(hextemp);
-		itemsbloom = compute_shard_entries(bsgs_m, 1000);
-		itemsbloom2 = compute_shard_entries(bsgs_m2, 1000);
-		itemsbloom3 = compute_shard_entries(bsgs_m3, 1000);
+                hextemp = BSGS_N.GetBase16();
+                printf("[+] N = 0x%s\n",hextemp);
+                free(hextemp);
+                itemsbloom = compute_shard_entries(bsgs_m, 1000);
+                itemsbloom2 = compute_shard_entries(bsgs_m2, 1000);
+                itemsbloom3 = compute_shard_entries(bsgs_m3, 1000);
+
+                        if(bsgs_bloom_target_gb > 0.0L) {
+                                long double base_main_bytes = estimate_bloom_bytes(itemsbloom, BLOOM_ERROR_MAIN) * 256.0L;
+                                long double target_bytes = bsgs_bloom_target_gb * BLOOM_GIGABYTE;
+                                long double target_per_bloom = target_bytes / 256.0L;
+                                long double bits_per_entry_budget = (target_per_bloom * 8.0L) / static_cast<long double>(itemsbloom);
+
+                                if(bits_per_entry_budget > 0.0L) {
+                                        long double capped_error;
+                                        long double min_bpe_for_underflow = bloom_min_bpe_limit();
+
+                                if(bits_per_entry_budget >= min_bpe_for_underflow) {
+                                        capped_error = LDBL_MIN;
+                                }
+                                else {
+                                        capped_error = expl(-bits_per_entry_budget * BLOOM_LN2_SQUARED);
+                                }
+
+                                if(capped_error > 0.0L && capped_error < 1.0L) {
+                                        bloom_error_main_active = capped_error;
+                                        if(capped_error == LDBL_MIN) {
+                                                printf("[+] Tuning main bloom error to %.12Lf (minimum representable) for ~%.2Lf GB (default %.2Lf GB)\n", bloom_error_main_active, target_bytes / BLOOM_GIGABYTE, base_main_bytes / BLOOM_GIGABYTE);
+                                        }
+                                        else {
+                                                printf("[+] Tuning main bloom error to %.12Lf for ~%.2Lf GB (default %.2Lf GB)\n", bloom_error_main_active, target_bytes / BLOOM_GIGABYTE, base_main_bytes / BLOOM_GIGABYTE);
+                                        }
+                                }
+                                else {
+                                        fprintf(stderr,"[W] Requested bloom budget could not produce a valid error rate; keeping default.\n");
+                                }
+                        }
+                        else {
+                                fprintf(stderr,"[W] Requested bloom budget is too small; keeping default error rate.\n");
+                        }
+                }
 
 		printf("[+] Bloom filter for %" PRIu64 " elements ",bsgs_m);
 		bloom_bP = (struct bloom*)calloc(256,sizeof(struct bloom));
@@ -1284,7 +1476,7 @@ rseed(generate_seed());
 #else
 			pthread_mutex_init(&bloom_bP_mutex[i],NULL);
 #endif
-			if(bloom_init2(&bloom_bP[i],itemsbloom,BLOOM_ERROR_MAIN)	== 1){
+			if(bloom_init2(&bloom_bP[i],itemsbloom,bloom_error_main_active)	== 1){
 				fprintf(stderr,"[E] error bloom_init _ [%" PRIu64 "]\n",i);
 				exit(EXIT_FAILURE);
 			}
@@ -1657,6 +1849,13 @@ rseed(generate_seed());
 		}
 		
 		if(!FLAGREADEDFILE1 || !FLAGREADEDFILE2 || !FLAGREADEDFILE3 || !FLAGREADEDFILE4)	{
+			if(!FLAGTHREADSUSER) {
+				unsigned int auto_threads = bsgs_auto_threads();
+				if(NTHREADS < (int)auto_threads) {
+					NTHREADS = auto_threads;
+					printf("[+] Auto-scaling BSGS bloom build threads to %u\n", NTHREADS);
+				}
+			}
 			if(FLAGREADEDFILE1 == 1)	{
 				/* 
 					We need just to make File 2 to File 4 this is
@@ -1889,24 +2088,15 @@ rseed(generate_seed());
 			fflush(stdout);
 		}	
 		if(!FLAGREADEDFILE1)	{
-			for(i = 0; i < 256 ; i++)	{
-				sha256((uint8_t*)bloom_bP[i].bf, bloom_bP[i].bytes,(uint8_t*) bloom_bP_checksums[i].data);
-				memcpy(bloom_bP_checksums[i].backup,bloom_bP_checksums[i].data,32);
-			}
+			compute_bloom_checksums_parallel(bloom_bP, bloom_bP_checksums, 256);
 			printf(".");
 		}
 		if(!FLAGREADEDFILE2)	{
-			for(i = 0; i < 256 ; i++)	{
-				sha256((uint8_t*)bloom_bPx2nd[i].bf, bloom_bPx2nd[i].bytes,(uint8_t*) bloom_bPx2nd_checksums[i].data);
-				memcpy(bloom_bPx2nd_checksums[i].backup,bloom_bPx2nd_checksums[i].data,32);
-			}
+			compute_bloom_checksums_parallel(bloom_bPx2nd, bloom_bPx2nd_checksums, 256);
 			printf(".");
 		}
 		if(!FLAGREADEDFILE4)	{
-			for(i = 0; i < 256 ; i++)	{
-				sha256((uint8_t*)bloom_bPx3rd[i].bf, bloom_bPx3rd[i].bytes,(uint8_t*) bloom_bPx3rd_checksums[i].data);
-				memcpy(bloom_bPx3rd_checksums[i].backup,bloom_bPx3rd_checksums[i].data,32);
-			}
+			compute_bloom_checksums_parallel(bloom_bPx3rd, bloom_bPx3rd_checksums, 256);
 			printf(".");
 		}
 		if(!FLAGREADEDFILE1 || !FLAGREADEDFILE2 || !FLAGREADEDFILE4)	{
@@ -4574,38 +4764,14 @@ void *thread_bPload(void *vargp)	{
 					bPtable[i_counter].index = i_counter;
 				}
 				if(!FLAGREADEDFILE4)	{
-#if defined(_WIN64) && !defined(__CYGWIN__)
-					WaitForSingleObject(bloom_bPx3rd_mutex[bloom_bP_index], INFINITE);
-					bloom_add(&bloom_bPx3rd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
-					ReleaseMutex(bloom_bPx3rd_mutex[bloom_bP_index]);
-#else
-					pthread_mutex_lock(&bloom_bPx3rd_mutex[bloom_bP_index]);
-					bloom_add(&bloom_bPx3rd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
-					pthread_mutex_unlock(&bloom_bPx3rd_mutex[bloom_bP_index]);
-#endif
+					bloom_add_atomic(&bloom_bPx3rd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
 				}
 			}
 			if(i_counter < bsgs_m2 && !FLAGREADEDFILE2)	{
-#if defined(_WIN64) && !defined(__CYGWIN__)
-				WaitForSingleObject(bloom_bPx2nd_mutex[bloom_bP_index], INFINITE);
-				bloom_add(&bloom_bPx2nd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
-				ReleaseMutex(bloom_bPx2nd_mutex[bloom_bP_index]);
-#else
-				pthread_mutex_lock(&bloom_bPx2nd_mutex[bloom_bP_index]);
-				bloom_add(&bloom_bPx2nd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
-				pthread_mutex_unlock(&bloom_bPx2nd_mutex[bloom_bP_index]);
-#endif	
+					bloom_add_atomic(&bloom_bPx2nd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
 			}
 			if(i_counter < to && !FLAGREADEDFILE1 )	{
-#if defined(_WIN64) && !defined(__CYGWIN__)
-				WaitForSingleObject(bloom_bP_mutex[bloom_bP_index], INFINITE);
-				bloom_add(&bloom_bP[bloom_bP_index], rawvalue ,BSGS_BUFFERXPOINTLENGTH);
-				ReleaseMutex(bloom_bP_mutex[bloom_bP_index);
-#else
-				pthread_mutex_lock(&bloom_bP_mutex[bloom_bP_index]);
-				bloom_add(&bloom_bP[bloom_bP_index], rawvalue ,BSGS_BUFFERXPOINTLENGTH);
-				pthread_mutex_unlock(&bloom_bP_mutex[bloom_bP_index]);
-#endif
+					bloom_add_atomic(&bloom_bP[bloom_bP_index], rawvalue ,BSGS_BUFFERXPOINTLENGTH);
 			}
 			i_counter++;
 		}
@@ -4757,27 +4923,11 @@ void *thread_bPload_2blooms(void *vargp)	{
 					bPtable[i_counter].index = i_counter;
 				}
 				if(!FLAGREADEDFILE4)	{
-#if defined(_WIN64) && !defined(__CYGWIN__)
-					WaitForSingleObject(bloom_bPx3rd_mutex[bloom_bP_index], INFINITE);
-					bloom_add(&bloom_bPx3rd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
-					ReleaseMutex(bloom_bPx3rd_mutex[bloom_bP_index]);
-#else
-					pthread_mutex_lock(&bloom_bPx3rd_mutex[bloom_bP_index]);
-					bloom_add(&bloom_bPx3rd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
-					pthread_mutex_unlock(&bloom_bPx3rd_mutex[bloom_bP_index]);
-#endif
+					bloom_add_atomic(&bloom_bPx3rd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
 				}
 			}
 			if(i_counter < bsgs_m2 && !FLAGREADEDFILE2)	{
-#if defined(_WIN64) && !defined(__CYGWIN__)
-					WaitForSingleObject(bloom_bPx2nd_mutex[bloom_bP_index], INFINITE);
-					bloom_add(&bloom_bPx2nd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
-					ReleaseMutex(bloom_bPx2nd_mutex[bloom_bP_index]);
-#else
-					pthread_mutex_lock(&bloom_bPx2nd_mutex[bloom_bP_index]);
-					bloom_add(&bloom_bPx2nd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
-					pthread_mutex_unlock(&bloom_bPx2nd_mutex[bloom_bP_index]);
-#endif			
+					bloom_add_atomic(&bloom_bPx2nd[bloom_bP_index], rawvalue, BSGS_BUFFERXPOINTLENGTH);
 			}
 			i_counter++;
 		}
@@ -5791,14 +5941,15 @@ void menu() {
 	printf("-h          show this help\n");
 	printf("-B Mode     BSGS now have some modes <sequential, backward, both, random, dance>\n");
 	printf("-b bits     For some puzzles you only need some numbers of bits in the test keys.\n");
-	printf("-c crypto   Search for specific crypto. <btc, eth> valid only w/ -m address\n");
-	printf("-C mini     Set the minikey Base only 22 character minikeys, ex: SRPqx8QiwnW4WNWnTVa2W5\n");
-	printf("-8 alpha    Set the bas58 alphabet for minikeys\n");
-	printf("-e          Enable endomorphism search (Only for address, rmd160 and vanity)\n");
-	printf("-f file     Specify file name with addresses or xpoints or uncompressed public keys\n");
-	printf("-I stride   Stride for xpoint, rmd160 and address, this option don't work with bsgs\n");
-	printf("-k value    Use this only with bsgs mode, k value is factor for M, more speed but more RAM use wisely\n");
-	printf("-l look     What type of address/hash160 are you looking for <compress, uncompress, both> Only for rmd160 and address\n");
+        printf("-c crypto   Search for specific crypto. <btc, eth> valid only w/ -m address\n");
+        printf("-C mini     Set the minikey Base only 22 character minikeys, ex: SRPqx8QiwnW4WNWnTVa2W5\n");
+        printf("-8 alpha    Set the bas58 alphabet for minikeys\n");
+        printf("-e          Enable endomorphism search (Only for address, rmd160 and vanity)\n");
+        printf("-f file     Specify file name with addresses or xpoints or uncompressed public keys\n");
+printf("-G gb       Target gigabytes for the main BSGS bloom (auto-tunes k/n and false-positive rate)\n");
+        printf("-I stride   Stride for xpoint, rmd160 and address, this option don't work with bsgs\n");
+        printf("-k value    Use this only with bsgs mode, k value is factor for M, more speed but more RAM use wisely\n");
+        printf("-l look     What type of address/hash160 are you looking for <compress, uncompress, both> Only for rmd160 and address\n");
 	printf("-m mode     mode of search for cryptos. (bsgs, xpoint, rmd160, address, vanity) default: address\n");
 	printf("-M          Matrix screen, feel like a h4x0r, but performance will dropped\n");
 	printf("-n number   Check for N sequential numbers before the random chosen, this only works with -R option\n");

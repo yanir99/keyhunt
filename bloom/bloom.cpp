@@ -58,6 +58,13 @@ inline static int test_bit(uint8_t *bf, uint64_t bit)
   }
 }
 
+inline static void atomic_set_bit(uint8_t *bf, uint64_t bit)
+{
+  uint64_t byte = bit >> 3;
+  uint8_t mask = 1 << (bit % 8);
+  __atomic_fetch_or(&bf[byte], mask, __ATOMIC_RELAXED);
+}
+
 static int bloom_check_add(struct bloom * bloom, const void * buffer, int len, int add)
 {
   if (bloom->ready == 0) {
@@ -147,6 +154,27 @@ int bloom_check(struct bloom * bloom, const void * buffer, int len)
   if (hits == bloom->hashes) {
     return 1;                // 1 == element already in (or collision)
   }
+  return 0;
+}
+
+
+int bloom_add_atomic(struct bloom * bloom, const void * buffer, int len)
+{
+  if (bloom->ready == 0) {
+    printf("bloom at %p not initialized!\n", (void *)bloom);
+    return -1;
+  }
+
+  uint64_t a = XXH64(buffer, len, 0x59f2815b16f81798);
+  uint64_t b = XXH64(buffer, len, a);
+  uint64_t x;
+  uint8_t i;
+
+  for (i = 0; i < bloom->hashes; i++) {
+    x = (a + b*i) % bloom->bits;
+    atomic_set_bit(bloom->bf, x);
+  }
+
   return 0;
 }
 
