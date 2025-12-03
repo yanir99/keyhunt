@@ -39,6 +39,7 @@ email: albertobsd@gmail.com
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <getopt.h>
 #include <pthread.h>
 #include <sys/random.h>
 #include <fcntl.h>
@@ -63,6 +64,7 @@ email: albertobsd@gmail.com
 #define MODE_PUB2RMD 4
 #define MODE_MINIKEYS 5
 #define MODE_VANITY 6
+#define MODE_BOMB 7
 
 #define SEARCH_UNCOMPRESS 0
 #define SEARCH_COMPRESS 1
@@ -194,6 +196,12 @@ bool initBloomFilter(struct bloom *bloom_arg,uint64_t items_bloom);
 void writeFileIfNeeded(const char *fileName);
 
 void calcualteindex(int i,Int *key);
+void run_mode_bomb(const Int &range_start, const Int &range_end, const Int &stride_value, const Int &bomb_Y_value, uint64_t bomb_Z_value, uint64_t bomb_big_count_value, const Int &bomb_max_sub_value, const char *fileName);
+#if defined(_WIN64) && !defined(__CYGWIN__)
+DWORD WINAPI thread_process_bomb(LPVOID vargp);
+#else
+void *thread_process_bomb(void *vargp);
+#endif
 #if defined(_WIN64) && !defined(__CYGWIN__)
 DWORD WINAPI thread_process_vanity(LPVOID vargp);
 DWORD WINAPI thread_process_minikeys(LPVOID vargp);
@@ -233,7 +241,7 @@ char *bit_range_str_min;
 char *bit_range_str_max;
 
 const char *bsgs_modes[5] = {"sequential","backward","both","random","dance"};
-const char *modes[7] = {"xpoint","address","bsgs","rmd160","pub2rmd","minikeys","vanity"};
+const char *modes[8] = {"xpoint","address","bsgs","rmd160","pub2rmd","minikeys","vanity","bomb"};
 const char *cryptos[3] = {"btc","eth","all"};
 const char *publicsearch[3] = {"uncompress","compress","both"};
 const char *default_fileName = "addresses.txt";
@@ -314,10 +322,46 @@ int FLAGRANGE = 0;
 int FLAGFILE = 0;
 int FLAGMODE = MODE_ADDRESS;
 int FLAGCRYPTO = 0;
-int FLAGRAWDATA	= 0;
+int FLAGRAWDATA = 0;
 int FLAGRANDOM = 0;
 int FLAG_N = 0;
 int FLAGPRECALCUTED_P_FILE = 0;
+
+uint64_t BOMB_Z = 1000;
+uint64_t BOMB_BIG_COUNT = 1024;
+Int BOMB_Y;
+Int BOMB_MAX_SUB;
+
+struct bomb_entry {
+        uint64_t subX[4];
+        int32_t offset;
+};
+
+struct bloom bomb_bloom;
+std::vector<bomb_entry> bomb_entries;
+std::vector<bsgs_xvalue> bomb_xvalues;
+
+struct bomb_context {
+        Int range_start;
+        Int range_end;
+        Int stride;
+        Int bomb_Y;
+        Point stepY;
+        Point neg_stepY;
+        uint64_t bomb_Z;
+        uint64_t bomb_big_count;
+        Point target_point;
+        bool target_compressed;
+};
+
+struct bomb_thread_data {
+        bomb_context *context;
+        uint32_t thread_id;
+};
+
+std::atomic<bool> BOMB_FOUND(false);
+std::atomic<uint64_t> BOMB_KEYS_TESTED(0);
+std::atomic<uint64_t> BOMB_COLLISIONS(0);
 
 int bitrange;
 char *str_N;
@@ -602,7 +646,7 @@ int main(int argc, char **argv)	{
 	FILE *fd,*fd_aux1,*fd_aux2,*fd_aux3;
 	uint64_t i,BASE,PERTHREAD_R,itemsbloom,itemsbloom2,itemsbloom3;
 	uint32_t finished;
-	int readed,continue_flag,check_flag,c,salir,index_value,j;
+        int readed,continue_flag,check_flag,c,salir,index_value,j,option_index;
 	Int total,pretotal,debugcount_mpz,seconds,div_pretotal,int_aux,int_r,int_q,int58;
 	struct bPload *bPload_temp_ptr;
 	size_t rsize;
@@ -622,19 +666,29 @@ int main(int argc, char **argv)	{
 
 	secp = new Secp256K1();
 	secp->Init();
-	OUTPUTSECONDS.SetInt32(30);
-	ZERO.SetInt32(0);
-	ONE.SetInt32(1);
-	BSGS_GROUP_SIZE.SetInt32(CPU_GRP_SIZE);
-	
+        OUTPUTSECONDS.SetInt32(30);
+        ZERO.SetInt32(0);
+        ONE.SetInt32(1);
+        BSGS_GROUP_SIZE.SetInt32(CPU_GRP_SIZE);
+        BOMB_Y.SetBase16("10000000");
+        BOMB_MAX_SUB.SetBase16("10000000000000000");
+
 rseed(generate_seed());
 	
 	
 	
 	printf("[+] Version %s, developed by AlbertoBSD\n",version);
 
-	while ((c = getopt(argc, argv, "deh6MqRSB:b:c:C:E:f:I:k:l:m:N:n:p:r:s:t:v:G:8:z:")) != -1) {
-		switch(c) {
+        static struct option long_options[] = {
+                {"bomb-Y", required_argument, 0, 1000},
+                {"bomb-Z", required_argument, 0, 1001},
+                {"bomb-big-count", required_argument, 0, 1002},
+                {"bomb-max-sub", required_argument, 0, 1003},
+                {0, 0, 0, 0}
+        };
+
+        while ((c = getopt_long(argc, argv, "deh6MqRSB:b:c:C:E:f:I:k:l:m:N:n:p:r:s:t:v:G:8:z:", long_options, &option_index)) != -1) {
+                switch(c) {
 			case 'h':
 				menu();
 			break;
@@ -778,8 +832,8 @@ rseed(generate_seed());
 				FLAGMATRIX = 1;
 				printf("[+] Matrix screen\n");
 			break;
-			case 'm':
-				switch(indexOf(optarg,modes,7)) {
+                        case 'm':
+                                switch(indexOf(optarg,modes,8)) {
 					case MODE_XPOINT: //xpoint
 						FLAGMODE = MODE_XPOINT;
 						printf("[+] Mode xpoint\n");
@@ -806,19 +860,23 @@ rseed(generate_seed());
 						FLAGMODE = MODE_MINIKEYS;
 						printf("[+] Mode minikeys\n");
 					break;
-					case MODE_VANITY:
-						FLAGMODE = MODE_VANITY;
-						printf("[+] Mode vanity\n");
-						if(vanity_bloom == NULL){
-							vanity_bloom = (struct bloom*) calloc(1,sizeof(struct bloom));
-							checkpointer((void *)vanity_bloom,__FILE__,"calloc","vanity_bloom" ,__LINE__ -1);
-						}
-					break;
-					default:
-						fprintf(stderr,"[E] Unknow mode value %s\n",optarg);
-						exit(EXIT_FAILURE);
-					break;
-				}
+                                        case MODE_VANITY:
+                                                FLAGMODE = MODE_VANITY;
+                                                printf("[+] Mode vanity\n");
+                                                if(vanity_bloom == NULL){
+                                                        vanity_bloom = (struct bloom*) calloc(1,sizeof(struct bloom));
+                                                        checkpointer((void *)vanity_bloom,__FILE__,"calloc","vanity_bloom" ,__LINE__ -1);
+                                                }
+                                        break;
+                                        case MODE_BOMB:
+                                                FLAGMODE = MODE_BOMB;
+                                                printf("[+] Mode bomb\n");
+                                        break;
+                                        default:
+                                                fprintf(stderr,"[E] Unknow mode value %s\n",optarg);
+                                                exit(EXIT_FAILURE);
+                                        break;
+                                }
 			break;
 			case 'n':
 				FLAG_N = 1;
@@ -930,6 +988,44 @@ rseed(generate_seed());
 				}
 				printf("[+] Bloom Size Multiplier %i\n",FLAGBLOOMMULTIPLIER);
 			break;
+			case 1000:
+				if(optarg[0] == '0' && optarg[1] == 'x') {
+					BOMB_Y.SetBase16(optarg + 2);
+				}
+				else	{
+					BOMB_Y.SetBase16(optarg);
+				}
+				hextemp = BOMB_Y.GetBase16();
+				printf("[+] Bomb Y scalar : 0x%s\n", hextemp);
+				free(hextemp);
+			break;
+			case 1001:
+				BOMB_Z = strtoull(optarg, NULL, 10);
+				if(BOMB_Z == 0) {
+					fprintf(stderr,"[E] Invalid bomb window size: %s\n", optarg);
+					exit(EXIT_FAILURE);
+				}
+				printf("[+] Bomb window size Z : %" PRIu64 "\n", BOMB_Z);
+			break;
+			case 1002:
+				BOMB_BIG_COUNT = strtoull(optarg, NULL, 10);
+				if(BOMB_BIG_COUNT == 0) {
+					fprintf(stderr,"[E] Invalid bomb big count: %s\n", optarg);
+					exit(EXIT_FAILURE);
+				}
+				printf("[+] Bomb big-count : %" PRIu64 "\n", BOMB_BIG_COUNT);
+			break;
+			case 1003:
+				if(optarg[0] == '0' && optarg[1] == 'x') {
+					BOMB_MAX_SUB.SetBase16(optarg + 2);
+				}
+				else	{
+					BOMB_MAX_SUB.SetBase16(optarg);
+				}
+				hextemp = BOMB_MAX_SUB.GetBase16();
+				printf("[+] Bomb max subtraction : 0x%s\n", hextemp);
+				free(hextemp);
+			break;
 			default:
 				fprintf(stderr,"[E] Unknow opcion -%c\n",c);
 				exit(EXIT_FAILURE);
@@ -996,6 +1092,11 @@ rseed(generate_seed());
 			FLAGRANGE = 0;
 		}
 	}
+	if(FLAGMODE == MODE_BOMB)	{
+		run_mode_bomb(n_range_start, n_range_end, stride, BOMB_Y, BOMB_Z, BOMB_BIG_COUNT, BOMB_MAX_SUB, fileName);
+		return 0;
+	}
+
 	if(FLAGMODE != MODE_BSGS && FLAGMODE != MODE_MINIKEYS)	{
 		BSGS_N.SetInt32(DEBUGCOUNT);
 		if(FLAGRANGE == 0 && FLAGBITRANGE == 0)	{
@@ -5944,6 +6045,233 @@ void sha256sse_23(uint8_t *src0, uint8_t *src1, uint8_t *src2, uint8_t *src3, ui
   sha256sse_1B(b0, b1, b2, b3, dst0, dst1, dst2, dst3);
 }
 
+static void bomb_store_point(Point &point, const Int &subX_value, int32_t offset) {
+        unsigned char rawvalue[32];
+        unsigned char subx_bytes[32];
+        struct bsgs_xvalue xvalue;
+        struct bomb_entry entry;
+
+        point.x.Get32Bytes(rawvalue);
+        bloom_add(&bomb_bloom, rawvalue, 32);
+
+        memcpy(xvalue.value, rawvalue + (32 - BSGS_XVALUE_RAM), BSGS_XVALUE_RAM);
+        xvalue.index = bomb_entries.size();
+        bomb_xvalues.push_back(xvalue);
+
+        Int subx_copy(subX_value);
+        subx_copy.Get32Bytes(subx_bytes);
+        memcpy(entry.subX, subx_bytes, sizeof(entry.subX));
+        entry.offset = offset;
+        bomb_entries.push_back(entry);
+}
+
+static void bomb_build_table(Point &target_point, Point &stepY, Point &neg_stepY, uint64_t bomb_Z_value, uint64_t bomb_big_count_value, const Int &bomb_max_sub_value) {
+        uint64_t itemsbloom = bomb_big_count_value * (bomb_Z_value * 2 + 1);
+        Int max_sub_copy(bomb_max_sub_value);
+
+        bomb_entries.clear();
+        bomb_xvalues.clear();
+        bomb_entries.reserve(itemsbloom);
+        bomb_xvalues.reserve(itemsbloom);
+
+        bloom_free(&bomb_bloom);
+        if(!initBloomFilter(&bomb_bloom, itemsbloom)) {
+                fprintf(stderr,"[E] Failed to initialize bomb bloom filter\n");
+                exit(EXIT_FAILURE);
+        }
+
+        for(uint64_t b = 0; b < bomb_big_count_value; b++) {
+                Int subX;
+                subX.Rand(&ZERO, &max_sub_copy);
+                Point subX_point = secp->ComputePublicKey(&subX);
+                Point negated_subX = secp->Negation(subX_point);
+                Point base_point = secp->AddDirect(target_point, negated_subX);
+
+                Point forward_point(base_point);
+                bomb_store_point(forward_point, subX, 0);
+                for(uint64_t pos = 1; pos <= bomb_Z_value; pos++) {
+                        forward_point = secp->AddDirect(forward_point, stepY);
+                        bomb_store_point(forward_point, subX, (int32_t)pos);
+                }
+
+                Point backward_point(base_point);
+                for(uint64_t neg = 1; neg <= bomb_Z_value; neg++) {
+                        backward_point = secp->AddDirect(backward_point, neg_stepY);
+                        bomb_store_point(backward_point, subX, -(int32_t)neg);
+                }
+        }
+
+        if(!bomb_xvalues.empty()) {
+                bsgs_sort(bomb_xvalues.data(), (int64_t)bomb_xvalues.size());
+        }
+}
+
+static bool bomb_read_targets(const char *fileName, std::vector<Point> &targets, std::vector<bool> &compressed_flags) {
+        FILE *fd = fopen(fileName,"r");
+        char aux[1024];
+        char *line_ptr;
+        Tokenizer tokenizer;
+        if(fd == NULL) {
+                fprintf(stderr,"[E] Error opening the file %s, line %i\n",fileName,__LINE__ - 3);
+                return false;
+        }
+
+        while((line_ptr = fgets(aux,1022,fd)) == aux) {
+                trim(aux," \t\n\r");
+                if(strlen(aux) >= 66) {
+                        stringtokenizer(aux,&tokenizer);
+                        char *token = nextToken(&tokenizer);
+                        if(token != NULL) {
+                                Point parsed_point;
+                                bool is_compressed = false;
+                                if(secp->ParsePublicKeyHex(token, parsed_point, is_compressed)) {
+                                        targets.push_back(parsed_point);
+                                        compressed_flags.push_back(is_compressed);
+                                }
+                        }
+                        freetokenizer(&tokenizer);
+                }
+        }
+        fclose(fd);
+        return !targets.empty();
+}
+
+static int64_t bomb_find_index(const unsigned char *rawvalue) {
+        int64_t min = 0;
+        int64_t max = (int64_t)bomb_xvalues.size();
+
+        while(min < max) {
+                int64_t mid = min + (max - min) / 2;
+                int cmp = memcmp(rawvalue + (32 - BSGS_XVALUE_RAM), bomb_xvalues[mid].value, BSGS_XVALUE_RAM);
+                if(cmp == 0) {
+                        return mid;
+                }
+                if(cmp < 0) {
+                        max = mid;
+                }
+                else {
+                        min = mid + 1;
+                }
+        }
+        return -1;
+}
+
+static bool bomb_process_match(bomb_context *ctx, const Int &k_value, int32_t window_offset, const bomb_entry &entry) {
+        Int candidate(k_value);
+        Int deltaY;
+        deltaY.Set(&ctx->bomb_Y);
+        int64_t diff = (int64_t)window_offset - (int64_t)entry.offset;
+
+        if(diff >= 0) {
+                deltaY.Mult((uint64_t)diff);
+                candidate.Add(&deltaY);
+        }
+        else {
+                deltaY.Mult((uint64_t)(-diff));
+                candidate.Sub(&deltaY);
+        }
+
+        Int subX_value;
+        subX_value.Set32Bytes((unsigned char*)entry.subX);
+        candidate.Add(&subX_value);
+        candidate.Mod(&secp->order);
+
+        Point derived_point = secp->ComputePublicKey(&candidate);
+        if(derived_point.x.IsEqual(&ctx->target_point.x) && derived_point.y.IsEqual(&ctx->target_point.y)) {
+                writekey(ctx->target_compressed, &candidate);
+                BOMB_FOUND.store(true, std::memory_order_relaxed);
+                return true;
+        }
+        return false;
+}
+
+static bool bomb_check_point(bomb_context *ctx, const Int &k_value, int32_t window_offset, Point &point) {
+        unsigned char rawvalue[32];
+        point.x.Get32Bytes(rawvalue);
+        int r = bloom_check(&bomb_bloom, rawvalue, 32);
+        if(!r) {
+                return false;
+        }
+
+        BOMB_COLLISIONS.fetch_add(1, std::memory_order_relaxed);
+        int64_t idx = bomb_find_index(rawvalue);
+        if(idx < 0) {
+                return false;
+        }
+
+        int64_t start = idx;
+        while(start > 0 && memcmp(rawvalue + (32 - BSGS_XVALUE_RAM), bomb_xvalues[start - 1].value, BSGS_XVALUE_RAM) == 0) {
+                start--;
+        }
+
+        for(int64_t pos = start; pos < (int64_t)bomb_xvalues.size(); pos++) {
+                if(memcmp(rawvalue + (32 - BSGS_XVALUE_RAM), bomb_xvalues[pos].value, BSGS_XVALUE_RAM) != 0) {
+                        break;
+                }
+                const bomb_entry &entry = bomb_entries[bomb_xvalues[pos].index];
+                if(bomb_process_match(ctx, k_value, window_offset, entry)) {
+                        return true;
+                }
+        }
+        return false;
+}
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+DWORD WINAPI thread_process_bomb(LPVOID vargp) {
+#else
+void *thread_process_bomb(void *vargp)  {
+#endif
+        bomb_thread_data *data = (bomb_thread_data*)vargp;
+        bomb_context *ctx = data->context;
+        free(data);
+
+        Int k_value;
+        Point base_point, forward_point, backward_point;
+
+        while(!BOMB_FOUND.load(std::memory_order_relaxed)) {
+#if defined(_WIN64) && !defined(__CYGWIN__)
+                WaitForSingleObject(bsgs_thread, INFINITE);
+#else
+                pthread_mutex_lock(&bsgs_thread);
+#endif
+
+                k_value.Rand(&ctx->range_start, &ctx->range_end);
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+                ReleaseMutex(bsgs_thread);
+#else
+                pthread_mutex_unlock(&bsgs_thread);
+#endif
+
+                BOMB_KEYS_TESTED.fetch_add(1, std::memory_order_relaxed);
+                base_point = secp->ComputePublicKey(&k_value);
+
+                if(bomb_check_point(ctx, k_value, 0, base_point)) {
+                        break;
+                }
+
+                forward_point = base_point;
+                backward_point = base_point;
+                for(uint64_t step = 1; step <= ctx->bomb_Z && !BOMB_FOUND.load(std::memory_order_relaxed); step++) {
+                        forward_point = secp->AddDirect(forward_point, ctx->stepY);
+                        if(bomb_check_point(ctx, k_value, (int32_t)step, forward_point)) {
+                                break;
+                        }
+
+                        backward_point = secp->AddDirect(backward_point, ctx->neg_stepY);
+                        if(bomb_check_point(ctx, k_value, -(int32_t)step, backward_point)) {
+                                break;
+                        }
+                }
+        }
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+        return 0;
+#else
+        return NULL;
+#endif
+}
+
 void menu() {
 	printf("\nUsage:\n");
 	printf("-h          show this help\n");
@@ -5958,7 +6286,7 @@ void menu() {
         printf("-I stride   Stride for xpoint, rmd160 and address, this option don't work with bsgs\n");
         printf("-k value    Use this only with bsgs mode, k value is factor for M, more speed but more RAM use wisely\n");
         printf("-l look     What type of address/hash160 are you looking for <compress, uncompress, both> Only for rmd160 and address\n");
-	printf("-m mode     mode of search for cryptos. (bsgs, xpoint, rmd160, address, vanity) default: address\n");
+	printf("-m mode     mode of search for cryptos. (bsgs, xpoint, rmd160, address, vanity, minikeys, bomb) default: address\n");
 	printf("-M          Matrix screen, feel like a h4x0r, but performance will dropped\n");
 	printf("-n number   Check for N sequential numbers before the random chosen, this only works with -R option\n");
 	printf("            Use -n to set the N for the BSGS process. Bigger N more RAM needed\n");
@@ -5971,12 +6299,169 @@ void menu() {
 	printf("-t tn       Threads number, must be a positive integer\n");
 	printf("-v value    Search for vanity Address, only with -m vanity\n");
 	printf("-z value    Bloom size multiplier, only address,rmd160,vanity, xpoint, value >= 1\n");
+        printf("--bomb-Y hex           Bomb mode step scalar Y in hex. Default: 0x10000000.\n");
+        printf("--bomb-Z int           Bomb mode window size Z. Default: 1000.\n");
+        printf("--bomb-big-count int   Bomb mode big bombs per target. Default: 1024.\n");
+        printf("--bomb-max-sub hex     Bomb mode maximum subtraction scalar (subX) in hex. Default: 0x10000000000000000.\n");
 	printf("\nExample:\n\n");
 	printf("./keyhunt -m rmd160 -f tests/unsolvedpuzzles.rmd -b 66 -l compress -R -q -t 8\n\n");
 	printf("This line runs the program with 8 threads from the range 20000000000000000 to 40000000000000000 without stats output\n\n");
 	printf("Developed by AlbertoBSD\tTips BTC: 1Coffee1jV4gB5gaXfHgSHDz9xx9QSECVW\n");
 	printf("Thanks to Iceland always helping and sharing his ideas.\nTips to Iceland: bc1q39meky2mn5qjq704zz0nnkl0v7kj4uz6r529at\n\n");
 	exit(EXIT_FAILURE);
+}
+
+void run_mode_bomb(const Int &range_start, const Int &range_end, const Int &stride_value, const Int &bomb_Y_value, uint64_t bomb_Z_value, uint64_t bomb_big_count_value, const Int &bomb_max_sub_value, const char *fileName) {
+        char *hex_value;
+        char *hex_end;
+        Int range_start_copy(range_start);
+        Int range_end_copy(range_end);
+        Int stride_copy(stride_value);
+        Int bomb_Y_copy(bomb_Y_value);
+        Int bomb_max_sub_copy(bomb_max_sub_value);
+        std::vector<Point> bomb_targets;
+        std::vector<bool> bomb_targets_compressed;
+
+        printf("Mode: bomb\n");
+        hex_value = range_start_copy.GetBase16();
+        hex_end = range_end_copy.GetBase16();
+        printf("[+] -- from : 0x%s\n", hex_value);
+        free(hex_value);
+        printf("[+] -- to   : 0x%s\n", hex_end);
+        free(hex_end);
+        hex_value = stride_copy.GetBase16();
+        printf("[+] Stride : 0x%s\n", hex_value);
+        free(hex_value);
+        hex_value = bomb_Y_copy.GetBase16();
+        printf("[+] Bomb Y : 0x%s\n", hex_value);
+        free(hex_value);
+        printf("[+] Bomb Z : %" PRIu64 "\n", bomb_Z_value);
+        printf("[+] Bomb big-count : %" PRIu64 "\n", bomb_big_count_value);
+        hex_value = bomb_max_sub_copy.GetBase16();
+        printf("[+] Bomb max-sub : 0x%s\n", hex_value);
+        free(hex_value);
+
+        if(!fileName) {
+                fileName = default_fileName;
+        }
+
+        if(!bomb_read_targets(fileName, bomb_targets, bomb_targets_compressed)) {
+                fprintf(stderr,"[E] The file doesn't contain valid public keys for bomb mode\n");
+                exit(EXIT_FAILURE);
+        }
+
+        Point stepY = secp->ComputePublicKey(&bomb_Y_copy);
+        Point neg_stepY = secp->Negation(stepY);
+        uint64_t points_per_target = bomb_big_count_value * (bomb_Z_value * 2 + 1);
+
+        printf("[+] Loaded %zu bomb target(s) from %s\n", bomb_targets.size(), fileName);
+        printf("[+] Precomputing %" PRIu64 " points per target for big bombs\n", points_per_target);
+
+        for(size_t idx = 0; idx < bomb_targets.size(); idx++) {
+                printf("[+] Building big bomb table for target %zu (%s)\n", idx + 1, bomb_targets_compressed[idx] ? "compressed" : "uncompressed");
+                bomb_build_table(bomb_targets[idx], stepY, neg_stepY, bomb_Z_value, bomb_big_count_value, bomb_max_sub_copy);
+                printf("[+] Big bombs generated: %" PRIu64 "\n", bomb_big_count_value);
+                printf("[+] Points inserted: %zu\n", bomb_entries.size());
+
+                bomb_context ctx;
+                ctx.range_start.Set(&range_start_copy);
+                ctx.range_end.Set(&range_end_copy);
+                ctx.stride.Set(&stride_copy);
+                ctx.bomb_Y.Set(&bomb_Y_copy);
+                ctx.stepY = stepY;
+                ctx.neg_stepY = neg_stepY;
+                ctx.bomb_Z = bomb_Z_value;
+                ctx.bomb_big_count = bomb_big_count_value;
+                ctx.target_point = bomb_targets[idx];
+                ctx.target_compressed = bomb_targets_compressed[idx];
+
+                BOMB_FOUND.store(false, std::memory_order_relaxed);
+                BOMB_KEYS_TESTED.store(0, std::memory_order_relaxed);
+                BOMB_COLLISIONS.store(0, std::memory_order_relaxed);
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+                HANDLE *bomb_threads = (HANDLE*)calloc(NTHREADS, sizeof(HANDLE));
+#else
+                pthread_t *bomb_threads = (pthread_t *)calloc(NTHREADS, sizeof(pthread_t));
+#endif
+                checkpointer((void *)bomb_threads,__FILE__,"calloc","bomb_threads" ,__LINE__ -1 );
+
+                for(int t = 0; t < NTHREADS; t++) {
+                        bomb_thread_data *data = (bomb_thread_data*)malloc(sizeof(bomb_thread_data));
+                        checkpointer((void *)data,__FILE__,"malloc","bomb_thread_data" ,__LINE__ -1 );
+                        data->context = &ctx;
+                        data->thread_id = (uint32_t)t;
+#if defined(_WIN64) && !defined(__CYGWIN__)
+                        DWORD s = 0;
+                        bomb_threads[t] = CreateThread(NULL, 0, thread_process_bomb, (void*)data, 0, &s);
+                        if(bomb_threads[t] == NULL) {
+                                fprintf(stderr,"[E] CreateThread failed for bomb worker\n");
+                                exit(EXIT_FAILURE);
+                        }
+#else
+                        int s = pthread_create(&bomb_threads[t], NULL, thread_process_bomb, (void*)data);
+                        if(s != 0) {
+                                fprintf(stderr,"[E] pthread_create failed for bomb worker\n");
+                                exit(EXIT_FAILURE);
+                        }
+#endif
+                }
+
+                uint64_t interval = OUTPUTSECONDS.GetInt64();
+                uint64_t elapsed_seconds = 0;
+                uint64_t last_keys = 0;
+                auto last = std::chrono::steady_clock::now();
+
+                while(!BOMB_FOUND.load(std::memory_order_relaxed)) {
+                        sleep_ms(1000);
+                        elapsed_seconds++;
+
+                        if(interval > 0 && (elapsed_seconds % interval) == 0 && !FLAGQUIET) {
+                                uint64_t tested = BOMB_KEYS_TESTED.load(std::memory_order_relaxed);
+                                uint64_t collisions = BOMB_COLLISIONS.load(std::memory_order_relaxed);
+                                auto now = std::chrono::steady_clock::now();
+                                std::chrono::duration<double> diff = now - last;
+                                double rate = 0.0;
+                                if(diff.count() > 0) {
+                                        rate = (double)(tested - last_keys) / diff.count();
+                                }
+                                printf("[+] Bomb stats: tested %" PRIu64 " keys, %.2f keys/s, collisions %" PRIu64 "\n", tested, rate, collisions);
+                                last = now;
+                                last_keys = tested;
+                        }
+                }
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+                for(int t = 0; t < NTHREADS; t++) {
+                        WaitForSingleObject(bomb_threads[t], INFINITE);
+                        CloseHandle(bomb_threads[t]);
+                }
+#else
+                for(int t = 0; t < NTHREADS; t++) {
+                        pthread_join(bomb_threads[t], NULL);
+                }
+#endif
+                free(bomb_threads);
+
+                if(BOMB_FOUND.load(std::memory_order_relaxed)) {
+                        printf("[+] Bomb hit found for target %zu\n", idx + 1);
+                        bloom_free(&bomb_bloom);
+                        bomb_entries.clear();
+                        bomb_xvalues.clear();
+                        break;
+                }
+                else {
+                        printf("[+] No hit found for target %zu, continuing if more targets remain\n", idx + 1);
+                }
+
+                bloom_free(&bomb_bloom);
+                bomb_entries.clear();
+                bomb_xvalues.clear();
+        }
+
+        if(!BOMB_FOUND.load(std::memory_order_relaxed)) {
+                printf("[+] Bomb precomputation complete, no hits found\n");
+        }
 }
 
 bool vanityrmdmatch(unsigned char *rmdhash)	{
