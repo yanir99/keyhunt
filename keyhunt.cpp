@@ -361,6 +361,7 @@ struct bomb_thread_data {
 
 std::atomic<bool> BOMB_FOUND(false);
 std::atomic<uint64_t> BOMB_KEYS_TESTED(0);
+// Counts Bloom positives that require table lookups; higher values imply more per-key work during the random walk.
 std::atomic<uint64_t> BOMB_COLLISIONS(0);
 
 int bitrange;
@@ -6507,6 +6508,7 @@ void run_mode_bomb(const Int &range_start, const Int &range_end, const Int &stri
                 uint64_t interval = OUTPUTSECONDS.GetInt64();
                 uint64_t elapsed_seconds = 0;
                 uint64_t last_keys = 0;
+                uint64_t last_collisions = 0;
                 auto last = std::chrono::steady_clock::now();
 
                 while(!BOMB_FOUND.load(std::memory_order_relaxed)) {
@@ -6519,12 +6521,15 @@ void run_mode_bomb(const Int &range_start, const Int &range_end, const Int &stri
                                 auto now = std::chrono::steady_clock::now();
                                 std::chrono::duration<double> diff = now - last;
                                 double rate = 0.0;
+                                double collision_rate = 0.0;
                                 if(diff.count() > 0) {
                                         rate = (double)(tested - last_keys) / diff.count();
+                                        collision_rate = (double)(collisions - last_collisions) / diff.count();
                                 }
-                                printf("[+] Bomb stats: tested %" PRIu64 " keys, %.2f keys/s, collisions %" PRIu64 "\n", tested, rate, collisions);
+                                printf("[+] Bomb stats: tested %" PRIu64 " keys, %.2f keys/s, collisions %" PRIu64 " (%.2f/s)\n", tested, rate, collisions, collision_rate);
                                 last = now;
                                 last_keys = tested;
+                                last_collisions = collisions;
                         }
                 }
 
