@@ -434,9 +434,17 @@ Output:
 
 ## Endomorphism
 
-To enable endomorphism use `-e`
+To enable endomorphism use `-e`.
 
-endomorphism is only enabled for `address`, `rdm160` , `vanity` and `xpoint`
+Endomorphism works for `address`, `rdm160`, `vanity`, `xpoint`, and `bsgs` (including `-B random` or the default random walk).
+
+For BSGS in random mode you just need to add `-e` alongside your usual parameters. Example for a random-walk search across a range:
+
+```
+./keyhunt -m bsgs -B random -r START:END -R -e -t 8 -q
+```
+
+Replace `START:END` with your hexadecimal range; `-R` keeps the random walk behavior and `-e` enables the beta/λ endomorphism checks introduced for BSGS.
 
 
 But what the heck is `Endomorphism`?
