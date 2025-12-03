@@ -6368,7 +6368,7 @@ void run_mode_bomb(const Int &range_start, const Int &range_end, const Int &stri
         uint64_t points_per_target = bomb_big_count_value * (bomb_Z_value * 2 + 1);
 
         printf("[+] Loaded %zu bomb target(s) from %s\n", bomb_targets.size(), fileName);
-        printf("[+] Precomputing %" PRIu64 " points per target for big bombs\n", points_per_target);
+        printf("[+] Precomputing %" PRIu64 " points per target for big bombs (single-threaded stage)\n", points_per_target);
 
         for(size_t idx = 0; idx < bomb_targets.size(); idx++) {
                 printf("[+] Building big bomb table for target %zu (%s)\n", idx + 1, bomb_targets_compressed[idx] ? "compressed" : "uncompressed");
@@ -6419,6 +6419,8 @@ void run_mode_bomb(const Int &range_start, const Int &range_end, const Int &stri
                         }
 #endif
                 }
+
+                printf("[+] Bomb workers launched: %d thread(s)\n", NTHREADS);
 
                 uint64_t interval = OUTPUTSECONDS.GetInt64();
                 uint64_t elapsed_seconds = 0;
