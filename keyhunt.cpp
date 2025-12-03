@@ -6058,34 +6058,89 @@ void sha256sse_23(uint8_t *src0, uint8_t *src1, uint8_t *src2, uint8_t *src3, ui
   sha256sse_1B(b0, b1, b2, b3, dst0, dst1, dst2, dst3);
 }
 
-static void bomb_store_point(Point &point, const Int &subX_value, int32_t offset) {
+static void bomb_store_point(Point &point, const Int &subX_value, int32_t offset, uint64_t dest_index) {
         unsigned char rawvalue[32];
         unsigned char subx_bytes[32];
         struct bsgs_xvalue xvalue;
         struct bomb_entry entry;
 
         point.x.Get32Bytes(rawvalue);
-        bloom_add(&bomb_bloom, rawvalue, 32);
+        bloom_add_atomic(&bomb_bloom, rawvalue, 32);
 
         memcpy(xvalue.value, rawvalue + (32 - BSGS_XVALUE_RAM), BSGS_XVALUE_RAM);
-        xvalue.index = bomb_entries.size();
-        bomb_xvalues.push_back(xvalue);
+        xvalue.index = dest_index;
+        bomb_xvalues[dest_index] = xvalue;
 
         Int subx_copy(subX_value);
         subx_copy.Get32Bytes(subx_bytes);
         memcpy(entry.subX, subx_bytes, sizeof(entry.subX));
         entry.offset = offset;
-        bomb_entries.push_back(entry);
+        bomb_entries[dest_index] = entry;
+}
+
+struct bomb_build_thread_data {
+        Point *target_point;
+        Point *stepY;
+        Point *neg_stepY;
+        uint64_t bomb_Z;
+        uint64_t block_size;
+        uint64_t bomb_big_count;
+        Int bomb_max_sub;
+        std::atomic<uint64_t> *next_bomb;
+};
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+DWORD WINAPI bomb_build_thread(LPVOID arg) {
+#else
+void *bomb_build_thread(void *arg) {
+#endif
+        bomb_build_thread_data *data = (bomb_build_thread_data *)arg;
+        uint64_t block_size = data->block_size;
+        Int max_sub_copy(data->bomb_max_sub);
+
+        while(true) {
+                uint64_t idx = data->next_bomb->fetch_add(1, std::memory_order_relaxed);
+                if(idx >= data->bomb_big_count) {
+                        break;
+                }
+
+                uint64_t base_index = idx * block_size;
+                Int subX;
+                subX.Rand(&ZERO, &max_sub_copy);
+                Point subX_point = secp->ComputePublicKey(&subX);
+                Point negated_subX = secp->Negation(subX_point);
+                Point base_point = secp->AddDirect(*data->target_point, negated_subX);
+
+                uint64_t center_index = base_index + data->bomb_Z;
+                bomb_store_point(base_point, subX, 0, center_index);
+
+                Point forward_point(base_point);
+                for(uint64_t pos = 1; pos <= data->bomb_Z; pos++) {
+                        forward_point = secp->AddDirect(forward_point, *data->stepY);
+                        bomb_store_point(forward_point, subX, (int32_t)pos, base_index + data->bomb_Z + pos);
+                }
+
+                Point backward_point(base_point);
+                for(uint64_t neg = 1; neg <= data->bomb_Z; neg++) {
+                        backward_point = secp->AddDirect(backward_point, *data->neg_stepY);
+                        bomb_store_point(backward_point, subX, -(int32_t)neg, base_index + data->bomb_Z - neg);
+                }
+        }
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+        return 0;
+#else
+        return NULL;
+#endif
 }
 
 static void bomb_build_table(Point &target_point, Point &stepY, Point &neg_stepY, uint64_t bomb_Z_value, uint64_t bomb_big_count_value, const Int &bomb_max_sub_value) {
         uint64_t itemsbloom = bomb_big_count_value * (bomb_Z_value * 2 + 1);
-        Int max_sub_copy(bomb_max_sub_value);
-
+        uint64_t block_size = (bomb_Z_value * 2 + 1);
         bomb_entries.clear();
         bomb_xvalues.clear();
-        bomb_entries.reserve(itemsbloom);
-        bomb_xvalues.reserve(itemsbloom);
+        bomb_entries.resize(itemsbloom);
+        bomb_xvalues.resize(itemsbloom);
 
         bloom_free(&bomb_bloom);
         if(!initBloomFilter(&bomb_bloom, itemsbloom)) {
@@ -6093,26 +6148,53 @@ static void bomb_build_table(Point &target_point, Point &stepY, Point &neg_stepY
                 exit(EXIT_FAILURE);
         }
 
-        for(uint64_t b = 0; b < bomb_big_count_value; b++) {
-                Int subX;
-                subX.Rand(&ZERO, &max_sub_copy);
-                Point subX_point = secp->ComputePublicKey(&subX);
-                Point negated_subX = secp->Negation(subX_point);
-                Point base_point = secp->AddDirect(target_point, negated_subX);
+        std::atomic<uint64_t> next_bomb(0);
+        bomb_build_thread_data shared_data;
+        shared_data.target_point = &target_point;
+        shared_data.stepY = &stepY;
+        shared_data.neg_stepY = &neg_stepY;
+        shared_data.bomb_Z = bomb_Z_value;
+        shared_data.block_size = block_size;
+        shared_data.bomb_big_count = bomb_big_count_value;
+        shared_data.bomb_max_sub = bomb_max_sub_value;
+        shared_data.next_bomb = &next_bomb;
 
-                Point forward_point(base_point);
-                bomb_store_point(forward_point, subX, 0);
-                for(uint64_t pos = 1; pos <= bomb_Z_value; pos++) {
-                        forward_point = secp->AddDirect(forward_point, stepY);
-                        bomb_store_point(forward_point, subX, (int32_t)pos);
-                }
+#if defined(_WIN64) && !defined(__CYGWIN__)
+        HANDLE *build_threads = (HANDLE*)calloc(NTHREADS, sizeof(HANDLE));
+#else
+        pthread_t *build_threads = (pthread_t *)calloc(NTHREADS, sizeof(pthread_t));
+#endif
+        checkpointer((void *)build_threads,__FILE__,"calloc","bomb build threads" ,__LINE__ -1 );
 
-                Point backward_point(base_point);
-                for(uint64_t neg = 1; neg <= bomb_Z_value; neg++) {
-                        backward_point = secp->AddDirect(backward_point, neg_stepY);
-                        bomb_store_point(backward_point, subX, -(int32_t)neg);
+        for(int t = 0; t < NTHREADS; t++) {
+#if defined(_WIN64) && !defined(__CYGWIN__)
+                DWORD s = 0;
+                build_threads[t] = CreateThread(NULL, 0, bomb_build_thread, (void*)&shared_data, 0, &s);
+                if(build_threads[t] == NULL) {
+                        fprintf(stderr,"[E] CreateThread failed for bomb build worker\n");
+                        exit(EXIT_FAILURE);
                 }
+#else
+                int s = pthread_create(&build_threads[t], NULL, bomb_build_thread, (void*)&shared_data);
+                if(s != 0) {
+                        fprintf(stderr,"[E] pthread_create failed for bomb build worker\n");
+                        exit(EXIT_FAILURE);
+                }
+#endif
         }
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+        WaitForMultipleObjects(NTHREADS, build_threads, TRUE, INFINITE);
+        for(int t = 0; t < NTHREADS; t++) {
+                CloseHandle(build_threads[t]);
+        }
+        free(build_threads);
+#else
+        for(int t = 0; t < NTHREADS; t++) {
+                pthread_join(build_threads[t], NULL);
+        }
+        free(build_threads);
+#endif
 
         if(!bomb_xvalues.empty()) {
                 bsgs_sort(bomb_xvalues.data(), (int64_t)bomb_xvalues.size());
@@ -6368,7 +6450,7 @@ void run_mode_bomb(const Int &range_start, const Int &range_end, const Int &stri
         uint64_t points_per_target = bomb_big_count_value * (bomb_Z_value * 2 + 1);
 
         printf("[+] Loaded %zu bomb target(s) from %s\n", bomb_targets.size(), fileName);
-        printf("[+] Precomputing %" PRIu64 " points per target for big bombs (single-threaded stage)\n", points_per_target);
+        printf("[+] Precomputing %" PRIu64 " points per target for big bombs using %d thread(s)\n", points_per_target, NTHREADS);
 
         for(size_t idx = 0; idx < bomb_targets.size(); idx++) {
                 printf("[+] Building big bomb table for target %zu (%s)\n", idx + 1, bomb_targets_compressed[idx] ? "compressed" : "uncompressed");
