@@ -1093,6 +1093,19 @@ rseed(generate_seed());
 		}
 	}
 	if(FLAGMODE == MODE_BOMB)	{
+		if(FLAGRANGE == 0 && FLAGBITRANGE == 0) {
+			n_range_start.SetInt32(1);
+			n_range_end.Set(&secp->order);
+			n_range_diff.Set(&n_range_end);
+			n_range_diff.Sub(&n_range_start);
+		}
+		else if(FLAGBITRANGE) {
+			n_range_start.SetBase16(bit_range_str_min);
+			n_range_end.SetBase16(bit_range_str_max);
+			n_range_diff.Set(&n_range_end);
+			n_range_diff.Sub(&n_range_start);
+		}
+
 		run_mode_bomb(n_range_start, n_range_end, stride, BOMB_Y, BOMB_Z, BOMB_BIG_COUNT, BOMB_MAX_SUB, fileName);
 		return 0;
 	}
